@@ -253,7 +253,7 @@ OUTPUT_LANG_CHOICES = {
 
 RUN_STATES = ["idle", "running", "await_edit", "done", "failed"]
 
-DEFAULT_MAX_TOKENS = 1800
+DEFAULT_MAX_TOKENS = 8000
 DEFAULT_TEMPERATURE = 0.2
 
 
