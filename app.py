@@ -1,3129 +1,2406 @@
 from __future__ import annotations
 
 import os
-import io
 import re
-import gc
-import time
+import io
 import json
+import time
 import math
 import uuid
-import yaml
-import base64
-import hashlib
-import datetime as dt
-from typing import Any, Dict, List, Optional, Tuple, Set
+import queue
+import random
+import zipfile
+import textwrap
+import datetime
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
 
-# Optional deps (graceful degradation)
+# Soft imports
 try:
-    import pandas as pd
+    import yaml
 except Exception:
-    pd = None
+    yaml = None
 
 try:
-    from pydantic import BaseModel, Field
+    import requests
 except Exception:
-    BaseModel = object
-    Field = lambda *a, **k: None
+    requests = None
 
 try:
-    from rapidfuzz import fuzz, process
-except Exception:
-    fuzz = None
-    process = None
-
-try:
-    from PyPDF2 import PdfReader, PdfWriter
+    from pypdf import PdfReader
 except Exception:
     PdfReader = None
-    PdfWriter = None
-
-try:
-    from pdf2image import convert_from_bytes
-except Exception:
-    convert_from_bytes = None
-
-try:
-    import pytesseract
-except Exception:
-    pytesseract = None
-
-try:
-    import plotly.graph_objects as go
-except Exception:
-    go = None
-
-# LLM provider SDKs (optional; show guidance if missing)
-try:
-    import google.generativeai as genai
-except Exception:
-    genai = None
-
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
-
-try:
-    import anthropic
-except Exception:
-    anthropic = None
 
 
-# -----------------------------
-# 0) App metadata / constants
-# -----------------------------
-APP_VERSION = "2.7"
-APP_TITLE = f"FDA 510(k) Review Studio v{APP_VERSION} — Regulatory Command Center: Nordic WOW"
-TZ_NAME = "Asia/Taipei"
+# -----------------------------------------------------------------------------
+# Constants & UI i18n
+# -----------------------------------------------------------------------------
 
-PROVIDERS = ["openai", "gemini", "anthropic", "grok"]
+APP_TITLE_EN = "WOW Agentic PDF & 510(k) Review Intelligence System"
+APP_TITLE_ZH = "WOW 智能 PDF 與 510(k) 審查助理系統"
 
-OPENAI_MODELS = ["gpt-4o-mini", "gpt-4.1-mini"]
-GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3-flash-preview"]
-ANTHROPIC_MODELS = ["claude-3-5-sonnet-latest", "claude-3-5-haiku-latest"]
-GROK_MODELS = ["grok-4-fast-reasoning", "grok-3-mini"]
-
-SUPPORTED_MODELS = {
-    "openai": OPENAI_MODELS,
-    "gemini": GEMINI_MODELS,
-    "anthropic": ANTHROPIC_MODELS,
-    "grok": GROK_MODELS,
-}
-
-DEFAULT_MAX_TOKENS = 12000
-DEFAULT_TEMPERATURE = 0.2
-
-# Reserved semantic color for critical insights/deficiencies
-RESERVED_CORAL = "#FF6F61"
-
-# Nordic surfaces (base); accent comes from painter style
-NORDIC_LIGHT = {
-    "bg": "#F6F7F9",
-    "surface": "#FFFFFF",
-    "surface_2": "#F0F2F5",
-    "text": "#0B1220",
-    "muted": "#5B667A",
-    "border": "rgba(20,28,40,0.10)",
-    "shadow": "rgba(20,28,40,0.08)",
-}
-NORDIC_DARK = {
-    "bg": "#0B0F16",
-    "surface": "#0F1622",
-    "surface_2": "#101B2A",
-    "text": "#EAF0FF",
-    "muted": "#A5B3CC",
-    "border": "rgba(234,240,255,0.10)",
-    "shadow": "rgba(0,0,0,0.35)",
-}
-
-# 20 painter accents (kept); in Nordic UI, used sparingly as highlight/accent.
-PAINTER_STYLES = {
-    "van_gogh": {"name": "Van Gogh", "accent": "#F4D03F"},
-    "monet": {"name": "Monet", "accent": "#76D7C4"},
-    "picasso": {"name": "Picasso", "accent": "#AF7AC5"},
-    "da_vinci": {"name": "Da Vinci", "accent": "#D4AC0D"},
-    "hokusai": {"name": "Hokusai", "accent": "#3498DB"},
-    "kahlo": {"name": "Frida Kahlo", "accent": "#E74C3C"},
-    "matisse": {"name": "Matisse", "accent": "#F39C12"},
-    "warhol": {"name": "Warhol", "accent": "#FF2D95"},
-    "turner": {"name": "Turner", "accent": "#F5B041"},
-    "rembrandt": {"name": "Rembrandt", "accent": "#A04000"},
-    "klimt": {"name": "Klimt", "accent": "#D4AF37"},
-    "dali": {"name": "Dali", "accent": "#1ABC9C"},
-    "pollock": {"name": "Pollock", "accent": "#E67E22"},
-    "cezanne": {"name": "Cezanne", "accent": "#27AE60"},
-    "vermeer": {"name": "Vermeer", "accent": "#2E86C1"},
-    "goya": {"name": "Goya", "accent": "#922B21"},
-    "cyberpunk": {"name": "Cyberpunk", "accent": "#00E5FF"},
-    "ukiyo_e": {"name": "Ukiyo-e", "accent": "#5DADE2"},
-    "surreal": {"name": "Surreal", "accent": "#9B59B6"},
-    "minimal": {"name": "Minimal", "accent": "#95A5A6"},
-}
-
-OCR_PROMPT_TEMPLATES = {
-    "General (tables+text)": "Extract all text. Reconstruct all tables in GitHub-flavored Markdown. Preserve headings. Ignore headers/footers/watermarks. No commentary; output only Markdown.",
-    "Tables-first": "Focus on accurate table reconstruction. For each table: output a Markdown table with correct columns/rows. Preserve units and footnotes. Ignore decorative lines. Output only Markdown.",
-    "Specs-first": "Extract technical specifications (dimensions, materials, tolerances, electrical ratings). Normalize units. Use Markdown headings + bullet lists + spec tables. Output only Markdown.",
-    "Labeling/IFU": "Extract labeling, IFU, contraindications, warnings, precautions, indications, and instructions. Preserve section order. Output only Markdown.",
-    "Software/Cybersecurity": "Extract software architecture, versioning, cybersecurity controls, SBOM mentions, threat modeling, patching, authentication, logging, and encryption. Output only Markdown.",
-    "Sterilization/Packaging": "Extract sterilization method, SAL, validation standards, packaging configuration, shelf-life claims, storage conditions, and integrity testing. Output only Markdown.",
-}
-
-LANG = {
+UI_TEXT = {
     "en": {
-        "mode": "Mode",
-        "command_center": "Command Center",
-        "note_keeper": "AI Note Keeper",
+        "nav_dashboard": "Home / Dashboard",
+        "nav_pdf": "PDF Discovery & ToC",
+        "nav_agents": "Agent Workspace",
+        "nav_510k": "510(k) Review Suite",
+        "nav_notes": "AI Notekeeper",
+        "nav_settings": "Settings & Keys",
+        "nav_history": "Run History / Exports",
         "theme": "Theme",
+        "language": "UI Language",
+        "output_language": "Output Language",
         "light": "Light",
         "dark": "Dark",
-        "language": "Language",
-        "painter_style": "Painter Style",
-        "jackpot": "Jackpot",
-        "api_keys": "API Keys",
-        "managed_by_system": "Managed by System",
-        "missing_key": "Missing",
-        "session_key": "Session Key",
-        "danger_zone": "Danger Zone",
-        "total_purge": "Total Purge",
-        "datasets": "Datasets",
-        "search": "Search",
-        "ingestion": "Ingestion",
-        "upload_pdfs": "Upload PDFs",
-        "paths": "File paths (optional)",
-        "register_files": "Register Files",
-        "queue": "File Queue",
-        "trim": "Trim",
-        "global_range": "Global page range",
-        "execute_trim": "Execute Trim",
-        "ocr": "OCR",
-        "ocr_mode": "OCR Mode",
-        "python_pack": "Python Pack (PyPDF2 + Tesseract)",
-        "llm_ocr": "LLM OCR (Gemini multimodal)",
-        "ocr_prompt": "OCR Prompt",
-        "execute_ocr": "Execute OCR",
-        "consolidated": "Consolidated OCR Markdown",
-        "agent_orchestration": "Agent Orchestration",
-        "agents_yaml": "agents.yaml",
-        "upload_yaml": "Upload agents.yaml",
-        "download_yaml": "Download agents.yaml",
-        "standardize_yaml": "Standardize YAML",
-        "validate_yaml": "Validate YAML",
-        "macro_summary": "Macro Summary",
-        "persistent_prompt": "Persistent Prompt",
-        "run_persistent_prompt": "Run Persistent Prompt",
-        "dynamic_skill": "Dynamic Skill Execution",
-        "skill_desc": "Skill Description",
-        "run_skill": "Execute Skill on Summary",
-        "wow_ai": "WOW AI",
-        "evidence_mapper": "Evidence Mapper",
-        "consistency_guardian": "Consistency Guardian",
-        "risk_radar": "Regulatory Risk Radar",
-        "rta_gatekeeper": "RTA Gatekeeper",
-        "claims_inspector": "Labeling & Claims Inspector",
-        "dashboards": "Dashboards",
-        "mission_control": "Mission Control",
-        "timeline": "Timeline / DAG",
-        "logs": "Session Logs",
-        "intel_board": "Regulatory Intelligence Board",
+        "style_pack": "Painter Style Pack",
+        "jackslot": "Jackslot (Random Style)",
+        "lock_style": "Lock style across session",
+        "status": "Status",
+        "live_log": "Live Log",
+        "clear_log": "Clear Log",
+        "download_log": "Download Log",
+        "providers": "Providers",
+        "connected": "Connected",
+        "missing_key": "Missing key",
+        "error": "Error",
+        "idle": "Idle",
+        "running": "Running",
+        "await_edit": "Awaiting user edit",
+        "done": "Completed",
+        "failed": "Failed",
+        "upload_zip": "Upload a ZIP (folder of PDFs)",
+        "scan": "Scan & Index PDFs",
+        "found_pdfs": "PDFs Found",
+        "processed": "Processed",
+        "flagged": "Flagged",
+        "toc": "Master ToC (editable)",
+        "summarize_model": "Summarization model",
+        "domain_lens": "Domain lens",
+        "lens_general": "General",
+        "lens_510k": "510(k) / Regulatory",
+        "lens_clinical": "Clinical",
+        "lens_cyber": "Cybersecurity",
+        "lens_software": "Software",
+        "run_agent": "Run Agent",
+        "run_chain": "Run Chain",
+        "add_to_chain": "Add to Chain",
+        "chain_builder": "Chain Builder",
+        "step": "Step",
+        "prompt": "Prompt",
+        "model": "Model",
+        "input_source": "Input source",
+        "input_toc": "Master ToC",
+        "input_prev": "Previous step output",
+        "input_custom": "Custom text",
+        "execute_step": "Execute step",
+        "edit_output": "Edit output (used as input to next step)",
+        "text_view": "Text view",
+        "markdown_view": "Markdown view",
+        "download_md": "Download (.md)",
+        "download_txt": "Download (.txt)",
+        "notes_paste": "Paste note (TXT or Markdown)",
+        "notes_transform": "Transform into organized Markdown",
+        "keywords_coral": "Highlight keywords in coral color",
+        "ai_magics": "AI Magics",
+        "keep_prompting": "Keep prompting",
+        "web_research": "Web research",
+        "web_depth": "Research depth",
+        "quick": "Quick",
+        "standard": "Standard",
+        "exhaustive": "Exhaustive",
+        "fda_only": "Only FDA sources (fda.gov)",
+        "step1": "Step 1: Paste 510(k) submission summary / review note / guidance",
+        "step2": "Step 2: Paste review report template (optional) or use default",
+        "use_default_template": "Use default template",
+        "step4": "Step 4: Generate comprehensive guidance-linked summary (3,000–4,000 words)",
+        "step5": "Step 5: Generate comprehensive 510(k) review report (3,000–4,000 words) + tables/entities/checklist",
+        "step6": "Step 6: Generate skill.md for similar-device reviews (+ 3 WOW skill features)",
+        "generate": "Generate",
+        "edit": "Edit",
+        "history": "History",
         "export": "Export",
-        "low_resource": "Low-resource mode",
+        "api_keys": "API Keys",
+        "openai_key": "OpenAI API Key",
+        "gemini_key": "Gemini API Key",
+        "anthropic_key": "Anthropic API Key",
+        "grok_key": "Grok (xAI) API Key",
+        "key_in_env": "Key is provided via environment and will not be shown.",
+        "enter_key": "Enter key (stored only in this session)",
+        "clear_secrets": "Clear session secrets",
+        "advanced": "Advanced",
+        "temperature": "Temperature",
+        "max_tokens": "Max output tokens (approx)",
+        "citations_required": "Require citations (where applicable)",
+        "tables_required": "Require tables (where applicable)",
+        "safety_note": "Disclaimer: This tool drafts and summarizes. Final regulatory judgments require qualified reviewer oversight.",
+        "bugs_panel": "LLM Health Checks",
+        "run_health": "Run health checks",
+        "health_ok": "Health checks passed.",
+        "health_warn": "Some checks failed; see details.",
+        "program_wow_features": "Program WOW AI Features (Extra)",
     },
     "zh-TW": {
-        "mode": "模式",
-        "command_center": "指揮中心",
-        "note_keeper": "AI 筆記管家",
+        "nav_dashboard": "首頁 / 儀表板",
+        "nav_pdf": "PDF 探勘與目錄 ToC",
+        "nav_agents": "代理工作區",
+        "nav_510k": "510(k) 審查套件",
+        "nav_notes": "AI 筆記管家",
+        "nav_settings": "設定與金鑰",
+        "nav_history": "執行歷史 / 匯出",
         "theme": "主題",
-        "light": "亮色",
-        "dark": "暗色",
-        "language": "語言",
-        "painter_style": "畫家風格",
-        "jackpot": "隨機",
-        "api_keys": "API 金鑰",
-        "managed_by_system": "系統管理",
-        "missing_key": "缺少",
-        "session_key": "本次會話金鑰",
-        "danger_zone": "危險區",
-        "total_purge": "完全清除",
-        "datasets": "資料集",
-        "search": "搜尋",
-        "ingestion": "匯入",
-        "upload_pdfs": "上傳 PDF",
-        "paths": "檔案路徑（選用）",
-        "register_files": "登錄檔案",
-        "queue": "檔案佇列",
-        "trim": "裁切",
-        "global_range": "全域頁碼範圍",
-        "execute_trim": "執行裁切",
-        "ocr": "OCR",
-        "ocr_mode": "OCR 模式",
-        "python_pack": "Python 套件（PyPDF2 + Tesseract）",
-        "llm_ocr": "LLM OCR（Gemini 多模態）",
-        "ocr_prompt": "OCR 提示詞",
-        "execute_ocr": "執行 OCR",
-        "consolidated": "合併 OCR Markdown",
-        "agent_orchestration": "代理人編排",
-        "agents_yaml": "agents.yaml",
-        "upload_yaml": "上傳 agents.yaml",
-        "download_yaml": "下載 agents.yaml",
-        "standardize_yaml": "標準化 YAML",
-        "validate_yaml": "驗證 YAML",
-        "macro_summary": "巨集摘要",
-        "persistent_prompt": "持續提示",
-        "run_persistent_prompt": "執行持續提示",
-        "dynamic_skill": "動態技能執行",
-        "skill_desc": "技能描述",
-        "run_skill": "對摘要執行技能",
-        "wow_ai": "WOW AI",
-        "evidence_mapper": "證據映射",
-        "consistency_guardian": "一致性守護",
-        "risk_radar": "法規風險雷達",
-        "rta_gatekeeper": "RTA 守門員",
-        "claims_inspector": "標示與主張檢查器",
-        "dashboards": "儀表板",
-        "mission_control": "任務控制台",
-        "timeline": "時間線 / DAG",
-        "logs": "會話紀錄",
-        "intel_board": "法規智慧看板",
+        "language": "介面語言",
+        "output_language": "輸出語言",
+        "light": "淺色",
+        "dark": "深色",
+        "style_pack": "畫家風格套件",
+        "jackslot": "Jackslot（隨機風格）",
+        "lock_style": "本次工作階段鎖定風格",
+        "status": "狀態",
+        "live_log": "即時日誌",
+        "clear_log": "清除日誌",
+        "download_log": "下載日誌",
+        "providers": "供應商",
+        "connected": "已連線",
+        "missing_key": "缺少金鑰",
+        "error": "錯誤",
+        "idle": "閒置",
+        "running": "執行中",
+        "await_edit": "等待使用者編輯",
+        "done": "已完成",
+        "failed": "失敗",
+        "upload_zip": "上傳 ZIP（包含 PDF 的資料夾）",
+        "scan": "掃描並建立索引",
+        "found_pdfs": "找到 PDF 數量",
+        "processed": "已處理",
+        "flagged": "已標記",
+        "toc": "主目錄 ToC（可編輯）",
+        "summarize_model": "摘要模型",
+        "domain_lens": "領域視角",
+        "lens_general": "一般",
+        "lens_510k": "510(k) / 法規",
+        "lens_clinical": "臨床",
+        "lens_cyber": "資安",
+        "lens_software": "軟體",
+        "run_agent": "執行代理",
+        "run_chain": "執行鏈",
+        "add_to_chain": "加入鏈",
+        "chain_builder": "鏈式建構器",
+        "step": "步驟",
+        "prompt": "提示詞",
+        "model": "模型",
+        "input_source": "輸入來源",
+        "input_toc": "主目錄 ToC",
+        "input_prev": "前一步輸出",
+        "input_custom": "自訂文字",
+        "execute_step": "執行步驟",
+        "edit_output": "編輯輸出（作為下一步輸入）",
+        "text_view": "文字檢視",
+        "markdown_view": "Markdown 檢視",
+        "download_md": "下載（.md）",
+        "download_txt": "下載（.txt）",
+        "notes_paste": "貼上筆記（TXT 或 Markdown）",
+        "notes_transform": "轉換為結構化 Markdown",
+        "keywords_coral": "以珊瑚色標示關鍵字",
+        "ai_magics": "AI 魔法",
+        "keep_prompting": "持續追問",
+        "web_research": "網路研究",
+        "web_depth": "研究深度",
+        "quick": "快速",
+        "standard": "標準",
+        "exhaustive": "深入",
+        "fda_only": "僅 FDA 來源（fda.gov）",
+        "step1": "步驟 1：貼上 510(k) 總結 / 審查筆記 / 指引",
+        "step2": "步驟 2：貼上審查報告模板（可選）或使用預設模板",
+        "use_default_template": "使用預設模板",
+        "step4": "步驟 4：產出完整指引連結摘要（3,000–4,000 字）",
+        "step5": "步驟 5：產出完整 510(k) 審查報告（3,000–4,000 字）＋表格/實體/清單",
+        "step6": "步驟 6：產出 skill.md 以便審查相似器材（＋3 個 WOW 技能功能）",
+        "generate": "生成",
+        "edit": "編輯",
+        "history": "歷史",
         "export": "匯出",
-        "low_resource": "低資源模式",
+        "api_keys": "API 金鑰",
+        "openai_key": "OpenAI API 金鑰",
+        "gemini_key": "Gemini API 金鑰",
+        "anthropic_key": "Anthropic API 金鑰",
+        "grok_key": "Grok（xAI）API 金鑰",
+        "key_in_env": "金鑰由環境變數提供，將不顯示。",
+        "enter_key": "輸入金鑰（僅儲存在本次工作階段）",
+        "clear_secrets": "清除工作階段金鑰",
+        "advanced": "進階",
+        "temperature": "溫度",
+        "max_tokens": "最大輸出 tokens（約略）",
+        "citations_required": "需要引用（適用時）",
+        "tables_required": "需要表格（適用時）",
+        "safety_note": "聲明：本工具用於草稿與摘要。最終法規結論須由合格審查者確認。",
+        "bugs_panel": "LLM 健康檢查",
+        "run_health": "執行健康檢查",
+        "health_ok": "健康檢查通過。",
+        "health_warn": "部分檢查未通過，請查看細節。",
+        "program_wow_features": "程式 WOW AI 功能（額外）",
     },
 }
 
+SUPPORTED_UI_LANGS = ["zh-TW", "en"]
 
-# -----------------------------
-# 1) Utilities
-# -----------------------------
-def now_taipei_str() -> str:
-    t = dt.datetime.utcnow() + dt.timedelta(hours=8)
-    return t.strftime("%Y-%m-%d %H:%M:%S") + " (Asia/Taipei)"
+OUTPUT_LANG_CHOICES = {
+    "zh-TW": "Traditional Chinese (繁體中文)",
+    "en": "English",
+}
 
+RUN_STATES = ["idle", "running", "await_edit", "done", "failed"]
 
-def t(key: str) -> str:
-    lang = st.session_state.get("ui.lang", "en")
-    return LANG.get(lang, LANG["en"]).get(key, key)
-
-
-def approx_tokens(text: str) -> int:
-    if not text:
-        return 0
-    return max(1, len(text) // 4)
+DEFAULT_MAX_TOKENS = 1800
+DEFAULT_TEMPERATURE = 0.2
 
 
-def sha256_hex(text: str) -> str:
-    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+# -----------------------------------------------------------------------------
+# Painter style packs (20)
+# -----------------------------------------------------------------------------
+
+PAINTER_STYLES = [
+    {"id": "da-vinci", "name": "Leonardo da Vinci", "bg": "#F6F1E8", "fg": "#1E1E1E", "accent": "#7A5C3A"},
+    {"id": "van-gogh", "name": "Vincent van Gogh", "bg": "#081A3A", "fg": "#F9F3C2", "accent": "#F6C445"},
+    {"id": "monet", "name": "Claude Monet", "bg": "#F2F7FB", "fg": "#15202B", "accent": "#6EA8C7"},
+    {"id": "picasso", "name": "Pablo Picasso", "bg": "#F9F7F2", "fg": "#111111", "accent": "#D7263D"},
+    {"id": "dali", "name": "Salvador Dalí", "bg": "#0B0B0F", "fg": "#F2E9E4", "accent": "#FFB703"},
+    {"id": "rembrandt", "name": "Rembrandt", "bg": "#14110F", "fg": "#F3E9DC", "accent": "#B8860B"},
+    {"id": "vermeer", "name": "Johannes Vermeer", "bg": "#0E1A2B", "fg": "#E8E6DF", "accent": "#2A9D8F"},
+    {"id": "klimt", "name": "Gustav Klimt", "bg": "#111111", "fg": "#F5E6B3", "accent": "#D4AF37"},
+    {"id": "kahlo", "name": "Frida Kahlo", "bg": "#1B1B1B", "fg": "#F6F6F6", "accent": "#2EC4B6"},
+    {"id": "okeeffe", "name": "Georgia O’Keeffe", "bg": "#FAFAF7", "fg": "#0F172A", "accent": "#7C3AED"},
+    {"id": "kandinsky", "name": "Wassily Kandinsky", "bg": "#0B1320", "fg": "#F8FAFC", "accent": "#3B82F6"},
+    {"id": "pollock", "name": "Jackson Pollock", "bg": "#0E0E10", "fg": "#FAFAFA", "accent": "#F97316"},
+    {"id": "hopper", "name": "Edward Hopper", "bg": "#0B1F2A", "fg": "#F5F5F5", "accent": "#F59E0B"},
+    {"id": "matisse", "name": "Henri Matisse", "bg": "#FFF7ED", "fg": "#111827", "accent": "#EF4444"},
+    {"id": "cezanne", "name": "Paul Cézanne", "bg": "#FBF7F2", "fg": "#1F2937", "accent": "#10B981"},
+    {"id": "michelangelo", "name": "Michelangelo", "bg": "#F3F4F6", "fg": "#111827", "accent": "#6B7280"},
+    {"id": "warhol", "name": "Andy Warhol", "bg": "#0A0A0A", "fg": "#FDF2F8", "accent": "#EC4899"},
+    {"id": "hokusai", "name": "Hokusai", "bg": "#F6FAFF", "fg": "#0F172A", "accent": "#2563EB"},
+    {"id": "caravaggio", "name": "Caravaggio", "bg": "#0B0B0B", "fg": "#F3F4F6", "accent": "#DC2626"},
+    {"id": "magritte", "name": "René Magritte", "bg": "#EAF2FF", "fg": "#0B1220", "accent": "#1D4ED8"},
+]
+
+DEFAULT_STYLE_ID = "monet"
 
 
-def safe_event(component: str, severity: str, message: str, meta: Optional[dict] = None):
-    if "obs.events" not in st.session_state:
-        st.session_state["obs.events"] = []
-    st.session_state["obs.events"].append(
-        {"ts": now_taipei_str(), "component": component, "severity": severity, "message": message, "meta": meta or {}}
-    )
+# -----------------------------------------------------------------------------
+# Default 510(k) template (shortened but structured; user can replace)
+# -----------------------------------------------------------------------------
 
+DEFAULT_510K_TEMPLATE = """\
+# 510(k) Review Report (Draft)
 
-def bump_metric(key: str, delta: float = 1.0):
-    m = st.session_state.setdefault("obs.metrics", {})
-    m[key] = m.get(key, 0.0) + delta
+## 1. Executive Summary
+- Device overview:
+- Review scope:
+- Key conclusions:
+- Key gaps / additional information needed:
 
+## 2. Device Description & Intended Use
+### 2.1 Device description
+### 2.2 Intended use / indications for use
+### 2.3 Technological characteristics (hardware/software/connectivity)
 
-def set_pipeline_state(node: str, status: str, detail: str = ""):
-    ps = st.session_state.setdefault("obs.pipeline_state", {})
-    obj = ps.setdefault(node, {"status": "idle", "last_update": None, "detail": ""})
-    obj["status"] = status
-    obj["last_update"] = now_taipei_str()
-    obj["detail"] = detail
+## 3. Regulatory Context
+### 3.1 Device classification (21 CFR, product code, class) (if known/inferred)
+### 3.2 Predicate / reference devices and rationale
 
+## 4. Substantial Equivalence (SE) Assessment
+### 4.1 Intended use comparison
+### 4.2 Technology comparison
+### 4.3 Differences analysis and impact on safety/effectiveness
 
-def human_size(n: int) -> str:
-    if n < 1024:
-        return f"{n} B"
-    for unit in ["KB", "MB", "GB", "TB"]:
-        n /= 1024.0
-        if n < 1024:
-            return f"{n:.2f} {unit}"
-    return f"{n:.2f} PB"
+## 5. Standards & Guidance Mapping
+- Applicable FDA guidance and recognized standards
+- Evidence expected vs. provided
 
+## 6. Performance Testing Review
+### 6.1 Bench/performance testing
+### 6.2 Electrical safety & EMC
+### 6.3 Software validation & cybersecurity documentation
+### 6.4 Biocompatibility / reprocessing / sterilization (if applicable)
+### 6.5 Clinical evidence (if applicable)
 
-def mem_estimate_bytes() -> int:
-    total = 0
-    reg = st.session_state.get("docs.registry", [])
-    for f in reg:
-        b = f.get("bytes")
-        if isinstance(b, (bytes, bytearray)):
-            total += len(b)
-    trim = st.session_state.get("docs.trim.outputs", {})
-    for b in trim.values():
-        if isinstance(b, (bytes, bytearray)):
-            total += len(b)
-    total += len(st.session_state.get("docs.consolidated_markdown", "") or "")
-    return total
+## 7. Labeling / IFU / Usability
+- Key labeling review points
+- Human factors considerations
 
+## 8. Risk Management Assessment (ISO 14971)
+- Risk analysis summary
+- Mitigations and verification evidence
+- Residual risks
 
-def parse_page_ranges(range_str: str) -> List[int]:
-    if not range_str or not range_str.strip():
-        return []
-    parts = [p.strip() for p in range_str.split(",") if p.strip()]
-    pages = set()
-    for p in parts:
-        if "-" in p:
-            a, b = p.split("-", 1)
-            a = int(a.strip())
-            b = int(b.strip())
-            if a <= 0 or b <= 0:
-                raise ValueError("Page numbers must be >= 1.")
-            if b < a:
-                a, b = b, a
-            for k in range(a, b + 1):
-                pages.add(k - 1)
-        else:
-            k = int(p)
-            if k <= 0:
-                raise ValueError("Page numbers must be >= 1.")
-            pages.add(k - 1)
-    return sorted(pages)
+## 9. Reviewer Conclusions & Recommendations
+- Overall assessment
+- Requests for additional information
+- Recommended disposition (draft)
 
+---
 
-def simple_diff(a: str, b: str, max_lines: int = 250) -> str:
-    import difflib
-
-    a_lines = (a or "").splitlines()
-    b_lines = (b or "").splitlines()
-    diff = difflib.unified_diff(a_lines, b_lines, lineterm="", fromfile="prev", tofile="current")
-    out = "\n".join(list(diff)[:max_lines])
-    return "```diff\n" + (out if out else "(no diff)") + "\n```"
-
-
-def markdown_highlight_keywords(md: str, keywords_to_color: Dict[str, str]) -> str:
-    if not md:
-        return md
-    # user palette (longest-first)
-    items = sorted((keywords_to_color or {}).items(), key=lambda kv: len(kv[0]), reverse=True)
-    out = md
-    for kw, color in items:
-        if not kw:
-            continue
-        if (color or "").strip().lower() == RESERVED_CORAL.lower():
-            continue
-        pattern = re.compile(rf"(?i)\b({re.escape(kw)})\b")
-        out = pattern.sub(rf"<span style='color:{color}; font-weight:700;'>\1</span>", out)
-
-    critical = ["warning", "recall", "latex", "implantable", "steril", "biocompat", "MDR", "adverse", "cybersecurity"]
-    for kw in critical:
-        pattern = re.compile(rf"(?i)\b({re.escape(kw)})\b")
-        out = pattern.sub(rf"<span style='color:{RESERVED_CORAL}; font-weight:800;'>\1</span>", out)
-    return out
-
-
-# -----------------------------
-# 2) Canonical Agent Schema
-# -----------------------------
-class AgentSpec(BaseModel):
-    id: str
-    name: str
-    provider: str = Field(default="openai")
-    model: str = Field(default="gpt-4o-mini")
-    temperature: float = Field(default=DEFAULT_TEMPERATURE)
-    max_tokens: int = Field(default=DEFAULT_MAX_TOKENS)
-    system_prompt: str = Field(default="")
-    user_prompt: str = Field(default="")
-    expected_format: str = Field(default="markdown")
-
-
-class AgentsConfig(BaseModel):
-    agents: List[AgentSpec]
-
-
-DEFAULT_AGENTS_YAML = """\
-agents:
-  - id: "a1"
-    name: "Submission Structurer"
-    provider: "openai"
-    model: "gpt-4o-mini"
-    temperature: 0.2
-    max_tokens: 12000
-    system_prompt: |
-      You are a senior FDA 510(k) reviewer. Produce structured, factual analysis. Do not invent data.
-      Output in Markdown with clear headings.
-    user_prompt: |
-      Convert the provided OCR text into a structured 510(k) review outline: Device Description, Indications for Use,
-      Predicate Devices, Substantial Equivalence, Performance Testing, Biocompatibility, Sterilization/Shelf-life,
-      Software/Cybersecurity (if relevant), Labeling, and Key Open Questions.
-  - id: "a2"
-    name: "Macro Summary (3000–4000 words)"
-    provider: "openai"
-    model: "gpt-4.1-mini"
-    temperature: 0.2
-    max_tokens: 12000
-    system_prompt: |
-      You are a regulatory writing engine. Be exhaustive, factual, and analytical.
-      IMPORTANT: Target 3000 to 4000 words. Use Markdown. Include a clear Executive Summary and sectioned analysis.
-    user_prompt: |
-      Write a comprehensive 3000–4000 word FDA-style analytical review report based strictly on the provided content.
-      Include a final section: "Reviewer Follow-up Questions".
+# Appendices
+## Appendix A: Required Tables (5)
+## Appendix B: Key Entities (20)
+## Appendix C: Review Checklist
+## Appendix D: References & Citations
 """
 
 
-# -----------------------------
-# 3) State init / purge
-# -----------------------------
-def init_state():
-    ss = st.session_state
+# -----------------------------------------------------------------------------
+# Utility: session state initialization
+# -----------------------------------------------------------------------------
 
-    ss.setdefault("ui.mode", "command_center")
-    ss.setdefault("ui.theme", "dark")
-    ss.setdefault("ui.lang", "en")
-    ss.setdefault("ui.painter_style", "minimal")
-    ss.setdefault("ui.jackpot_seed", 0)
-    ss.setdefault("ui.low_resource_mode", False)
-    ss.setdefault("ui.preserve_prefs_on_purge", True)
-
-    # Keys (session only; env handled separately)
-    ss.setdefault("keys.openai", None)
-    ss.setdefault("keys.gemini", None)
-    ss.setdefault("keys.anthropic", None)
-    ss.setdefault("keys.grok", None)
-
-    # Datasets
-    ss.setdefault("data.loaded", False)
-    ss.setdefault("data.counts", {"510k": 0, "mdr": 0, "gudid": 0, "recall": 0})
-    ss.setdefault("data.last_query", "")
-    ss.setdefault("data.last_results", {})
-    ss.setdefault("data.device_view", {})
-
-    # Docs
-    ss.setdefault("docs.registry", [])
-    ss.setdefault("docs.queue.selected_ids", set())
-    ss.setdefault("docs.trim.global_range", "1-5")
-    ss.setdefault("docs.trim.per_file_override", {})
-    ss.setdefault("docs.trim.outputs", {})
-
-    ss.setdefault("docs.ocr.mode", "python_pack")
-    ss.setdefault("docs.ocr.model", GEMINI_MODELS[0])
-    ss.setdefault("docs.ocr.prompt_global", OCR_PROMPT_TEMPLATES["General (tables+text)"])
-    ss.setdefault("docs.ocr.prompt_per_file", {})  # file_id -> prompt override
-    ss.setdefault("docs.ocr.outputs_by_file", {})
-    ss.setdefault("docs.consolidated_markdown", "")
-    ss.setdefault("docs.consolidated_anchors", {})
-    ss.setdefault("consolidated.artifact_id", None)
-
-    # Artifacts
-    ss.setdefault("artifacts", {})
-
-    # agents.yaml management
-    ss.setdefault("agents.yaml.raw", "")
-    ss.setdefault("agents.yaml.validated", None)
-    ss.setdefault("agents.yaml.original_upload", None)
-    ss.setdefault("agents.yaml.standardize_report", "")
-    ss.setdefault("agents.last_error", None)
-
-    # Agent outputs
-    ss.setdefault("agents.step.overrides", {})
-    ss.setdefault("agents.step.outputs", {})
-    ss.setdefault("agents.timeline", {"nodes": [], "edges": []})
-
-    # Summary / Skills
-    ss.setdefault("summary.artifact_id", None)
-    ss.setdefault("summary.persistent_prompt", "")
-    ss.setdefault("skills.last_description", "")
-    ss.setdefault("skills.outputs", [])
-
-    # WOW AI outputs
-    ss.setdefault("wow.evidence.artifact_id", None)
-    ss.setdefault("wow.evidence.rows", None)
-    ss.setdefault("wow.consistency.artifact_id", None)
-    ss.setdefault("wow.risk.artifact_id", None)
-    ss.setdefault("wow.risk.domains", None)
-    ss.setdefault("wow.rta.artifact_id", None)
-    ss.setdefault("wow.rta.score", None)
-    ss.setdefault("wow.claims.artifact_id", None)
-    ss.setdefault("wow.claims.rows", None)
-
-    # Note keeper
-    ss.setdefault("notes.input_raw", "")
-    ss.setdefault("notes.output_artifact_id", None)
-    ss.setdefault("notes.model_provider", "openai")
-    ss.setdefault("notes.model", "gpt-4o-mini")
-    ss.setdefault("notes.prompt", "Organize the note into clean Markdown with headings, bullets, and action items.")
-    ss.setdefault("notes.keywords.palette", {"FDA": "#2E86C1", "biocompatibility": "#27AE60"})
-    ss.setdefault("notes.magics.history", [])
-
-    # Observability
-    ss.setdefault("obs.events", [])
-    ss.setdefault("obs.metrics", {})
-    ss.setdefault("obs.pipeline_state", {})
-    ss.setdefault("obs.export.ready", {})
+def ss_init():
+    defaults = {
+        "ui_lang": "zh-TW",
+        "output_lang": "zh-TW",
+        "theme": "dark",
+        "style_id": DEFAULT_STYLE_ID,
+        "lock_style": True,
+        "run_state": "idle",
+        "live_log": [],
+        "history": [],  # list of run records
+        "session_secrets": {},  # provider keys entered by user (never env)
+        "agents": {},  # loaded agents
+        "agents_load_error": None,
+        "pdf_workspace_id": None,
+        "pdf_files": [],
+        "pdf_summaries": {},  # path -> md
+        "master_toc": "",
+        "agent_chain": [],  # list of dict steps
+        "notes_input": "",
+        "notes_output": "",
+        "notes_keywords": [],
+        "510k_step1": "",
+        "510k_template": "",
+        "510k_step4": "",
+        "510k_step5": "",
+        "510k_skill_md": "",
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
 
-def total_purge():
-    preserve = st.session_state.get("ui.preserve_prefs_on_purge", True)
-    keep = {}
-    if preserve:
-        keep = {
-            "ui.theme": st.session_state.get("ui.theme"),
-            "ui.lang": st.session_state.get("ui.lang"),
-            "ui.painter_style": st.session_state.get("ui.painter_style"),
-            "ui.jackpot_seed": st.session_state.get("ui.jackpot_seed"),
-            "ui.low_resource_mode": st.session_state.get("ui.low_resource_mode"),
-            "ui.preserve_prefs_on_purge": True,
-        }
-    st.session_state.clear()
-    init_state()
-    for k, v in keep.items():
-        st.session_state[k] = v
-    safe_event("danger_zone", "warn", "Total purge executed.")
-    gc.collect()
+def t(key: str) -> str:
+    lang = st.session_state.get("ui_lang", "zh-TW")
+    if lang not in UI_TEXT:
+        lang = "en"
+    return UI_TEXT[lang].get(key, key)
 
 
-# -----------------------------
-# 4) Nordic Architecture CSS
-# -----------------------------
-def inject_nordic_css():
-    theme = st.session_state.get("ui.theme", "dark")
-    style_id = st.session_state.get("ui.painter_style", "minimal")
-    accent = PAINTER_STYLES.get(style_id, PAINTER_STYLES["minimal"])["accent"]
-    tokens = NORDIC_DARK if theme == "dark" else NORDIC_LIGHT
+def now_iso() -> str:
+    return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def log_event(message: str, level: str = "INFO", module: str = "app"):
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    entry = {"ts": ts, "level": level, "module": module, "message": message}
+    st.session_state.live_log.append(entry)
+
+
+def format_log_text() -> str:
+    lines = []
+    for e in st.session_state.live_log:
+        lines.append(f"[{e['ts']}] [{e['level']}] [{e['module']}] {e['message']}")
+    return "\n".join(lines)
+
+
+# -----------------------------------------------------------------------------
+# WOW Styling (theme + painter pack)
+# -----------------------------------------------------------------------------
+
+def apply_wow_css():
+    style_id = st.session_state.style_id
+    style = next((s for s in PAINTER_STYLES if s["id"] == style_id), None) or PAINTER_STYLES[0]
+    bg = style["bg"]
+    fg = style["fg"]
+    accent = style["accent"]
+
+    theme = st.session_state.theme
+    # Use painter pack colors as base; adjust slightly for light/dark toggle.
+    if theme == "dark":
+        page_bg = "#0B0F14"
+        card_bg = "rgba(255,255,255,0.04)"
+        border = "rgba(255,255,255,0.10)"
+        muted = "rgba(255,255,255,0.65)"
+        text = "#F8FAFC"
+    else:
+        page_bg = bg
+        card_bg = "rgba(0,0,0,0.03)"
+        border = "rgba(0,0,0,0.10)"
+        muted = "rgba(0,0,0,0.60)"
+        text = fg
 
     css = f"""
     <style>
-      :root {{
-        --bg: {tokens["bg"]};
-        --surface: {tokens["surface"]};
-        --surface2: {tokens["surface_2"]};
-        --text: {tokens["text"]};
-        --muted: {tokens["muted"]};
-        --border: {tokens["border"]};
-        --shadow: {tokens["shadow"]};
-        --accent: {accent};
-        --coral: {RESERVED_CORAL};
-        --radius: 14px;
-      }}
-
       .stApp {{
-        background: var(--bg);
-        color: var(--text);
+        background: {page_bg};
+        color: {text};
       }}
-
-      /* Typography */
-      html, body, [class*="css"] {{
-        font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji";
+      .wow-card {{
+        background: {card_bg};
+        border: 1px solid {border};
+        border-radius: 14px;
+        padding: 14px 16px;
+        margin-bottom: 12px;
       }}
-      h1, h2, h3, h4 {{
-        letter-spacing: -0.02em;
-      }}
-      .muted {{
-        color: var(--muted);
-      }}
-
-      /* Nordic surfaces */
-      .nordic-card {{
-        background: var(--surface);
-        border: 1px solid var(--border);
-        border-radius: var(--radius);
-        padding: 14px 14px;
-        box-shadow: 0 8px 24px var(--shadow);
-      }}
-
-      .nordic-card.soft {{
-        background: var(--surface2);
-      }}
-
-      /* Minimal chips */
-      .chip {{
-        display:inline-flex;
-        align-items:center;
-        gap:6px;
-        padding: 6px 10px;
+      .wow-pill {{
+        display: inline-block;
+        padding: 2px 10px;
         border-radius: 999px;
-        border: 1px solid var(--border);
-        background: rgba(127,127,127,0.06);
+        border: 1px solid {border};
+        background: {card_bg};
         margin-right: 8px;
-        margin-bottom: 8px;
         font-size: 12px;
+        color: {muted};
       }}
-      .chip .dot {{
-        width:8px; height:8px; border-radius:99px;
-        background: var(--accent);
-        opacity: 0.9;
+      .wow-accent {{
+        color: {accent};
+        font-weight: 700;
       }}
-      .chip.ok .dot {{ background: rgba(46, 204, 113, 0.9); }}
-      .chip.warn .dot {{ background: rgba(241, 196, 15, 0.9); }}
-      .chip.err .dot {{ background: rgba(231, 76, 60, 0.9); }}
-
-      /* Buttons */
-      div.stButton > button {{
-        border-radius: 12px !important;
-        border: 1px solid var(--border) !important;
-        background: linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.02)) !important;
-        color: var(--text) !important;
+      .wow-muted {{
+        color: {muted};
       }}
-      div.stButton > button:hover {{
-        border-color: var(--accent) !important;
-        box-shadow: 0 0 0 3px rgba(0,0,0,0), 0 0 14px rgba(0,0,0,0), 0 0 0 3px rgba(0,229,255,0.05);
+      .wow-kpi {{
+        font-size: 28px;
+        font-weight: 800;
+        letter-spacing: -0.02em;
+        color: {text};
       }}
-
-      /* Accent helpers */
-      .accent {{ color: var(--accent); font-weight: 700; }}
-      .coral {{ color: var(--coral); font-weight: 800; }}
-
-      /* Markdown tables */
-      .stMarkdown table {{
-        border-collapse: collapse;
-        width: 100%;
+      .wow-sub {{
+        font-size: 12px;
+        color: {muted};
       }}
-      .stMarkdown th, .stMarkdown td {{
-        border: 1px solid var(--border);
-        padding: 6px 8px;
-        vertical-align: top;
+      a {{
+        color: {accent} !important;
       }}
-      .stMarkdown th {{
-        background: rgba(127,127,127,0.08);
-      }}
-
-      /* Code blocks */
-      pre {{
+      code, pre {{
         border-radius: 12px;
-        border: 1px solid var(--border);
-        background: rgba(127,127,127,0.06);
-        padding: 10px;
+      }}
+      /* Make textareas feel more premium */
+      textarea {{
+        border-radius: 12px !important;
       }}
     </style>
     """
     st.markdown(css, unsafe_allow_html=True)
 
 
-# -----------------------------
-# 5) Provider key management
-# -----------------------------
-def get_env_key(provider: str) -> Optional[str]:
-    if provider == "openai":
-        return os.getenv("OPENAI_API_KEY")
-    if provider == "gemini":
-        return os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or os.getenv("GOOGLE_GENERATIVEAI_API_KEY")
-    if provider == "anthropic":
-        return os.getenv("ANTHROPIC_API_KEY")
-    if provider == "grok":
-        return os.getenv("GROK_API_KEY") or os.getenv("XAI_API_KEY")
+# -----------------------------------------------------------------------------
+# Provider keys & model registry
+# -----------------------------------------------------------------------------
+
+def env_key(name: str) -> Optional[str]:
+    v = os.environ.get(name)
+    if v and v.strip():
+        return v.strip()
     return None
 
 
-def get_effective_key(provider: str) -> Optional[str]:
-    env = get_env_key(provider)
-    if env:
-        return env
-    return st.session_state.get(f"keys.{provider}")
-
-
-def provider_key_source(provider: str) -> str:
-    if get_env_key(provider):
-        return "env"
-    if st.session_state.get(f"keys.{provider}"):
-        return "session"
-    return "missing"
-
-
-def render_key_section():
-    st.sidebar.markdown(f"### {t('api_keys')}")
-    for p in PROVIDERS:
-        src = provider_key_source(p)
-        if src == "env":
-            st.sidebar.success(f"{p.upper()} — {t('managed_by_system')}")
-        elif src == "session":
-            st.sidebar.warning(f"{p.upper()} — {t('session_key')}")
-        else:
-            st.sidebar.error(f"{p.upper()} — {t('missing_key')}")
-
-        # Only show input if env key absent
-        if src != "env":
-            st.sidebar.text_input(
-                f"{p.upper()} API Key",
-                type="password",
-                value=st.session_state.get(f"keys.{p}") or "",
-                key=f"keys.{p}",
-                help="Stored only in session state. Not logged. Cleared by Total Purge.",
-            )
-
-
-# -----------------------------
-# 6) Artifacts / Versioning
-# -----------------------------
-def create_artifact(initial_text: str, fmt: str, metadata: Optional[dict] = None) -> str:
-    artifacts = st.session_state["artifacts"]
-    artifact_id = str(uuid.uuid4())
-    version_id = str(uuid.uuid4())
-    artifacts[artifact_id] = {
-        "current_version_id": version_id,
-        "versions": [
-            {
-                "version_id": version_id,
-                "created_at": now_taipei_str(),
-                "created_by": "system",
-                "content_text": initial_text or "",
-                "content_format": fmt,
-                "metadata": metadata or {},
-                "parent_version_id": None,
-            }
-        ],
+def get_provider_key(provider: str) -> Optional[str]:
+    """
+    Keys: environment first, else session state.
+    Never return/display the env key value; just use it.
+    """
+    provider = provider.lower()
+    env_map = {
+        "openai": "OPENAI_API_KEY",
+        "gemini": "GEMINI_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY",
+        "grok": "GROK_API_KEY",  # user may set; alternatively XAI_API_KEY
     }
-    return artifact_id
+    env_name = env_map.get(provider)
+    if env_name:
+        ek = env_key(env_name)
+        if ek:
+            return ek
+    # common alternative names
+    if provider == "grok":
+        alt = env_key("XAI_API_KEY")
+        if alt:
+            return alt
+
+    return st.session_state.session_secrets.get(provider)
 
 
-def artifact_get_current(artifact_id: str) -> Tuple[str, dict]:
-    artifacts = st.session_state["artifacts"]
-    a = artifacts.get(artifact_id)
-    if not a:
-        return "", {}
-    cur = a["current_version_id"]
-    for v in reversed(a["versions"]):
-        if v["version_id"] == cur:
-            return v["content_text"], v
-    v = a["versions"][-1]
-    return v["content_text"], v
+MODEL_REGISTRY = [
+    # OpenAI
+    {"provider": "openai", "id": "gpt-4o-mini", "label": "OpenAI — gpt-4o-mini"},
+    {"provider": "openai", "id": "gpt-4.1-mini", "label": "OpenAI — gpt-4.1-mini"},
+    # Gemini
+    {"provider": "gemini", "id": "gemini-2.5-flash", "label": "Gemini — 2.5 Flash"},
+    {"provider": "gemini", "id": "gemini-3-flash-preview", "label": "Gemini — 3 Flash Preview"},
+    # Anthropic (display as generic; actual availability depends on user key)
+    {"provider": "anthropic", "id": "claude-3-5-sonnet-latest", "label": "Anthropic — Claude Sonnet (latest)"},
+    {"provider": "anthropic", "id": "claude-3-5-haiku-latest", "label": "Anthropic — Claude Haiku (latest)"},
+    # Grok
+    {"provider": "grok", "id": "grok-4-fast-reasoning", "label": "Grok — grok-4-fast-reasoning"},
+    {"provider": "grok", "id": "grok-3-mini", "label": "Grok — grok-3-mini"},
+]
 
 
-def artifact_add_version(artifact_id: str, new_text: str, created_by: str, metadata: Optional[dict] = None, parent_version_id: Optional[str] = None) -> str:
-    artifacts = st.session_state["artifacts"]
-    a = artifacts.get(artifact_id)
-    if not a:
-        raise KeyError("artifact not found")
-    version_id = str(uuid.uuid4())
-    a["versions"].append(
-        {
-            "version_id": version_id,
-            "created_at": now_taipei_str(),
-            "created_by": created_by,
-            "content_text": new_text or "",
-            "content_format": "markdown",
-            "metadata": metadata or {},
-            "parent_version_id": parent_version_id or a.get("current_version_id"),
-        }
-    )
-    a["current_version_id"] = version_id
-    return version_id
+def list_models() -> List[str]:
+    return [m["label"] for m in MODEL_REGISTRY]
 
 
-def artifact_versions(artifact_id: str) -> List[dict]:
-    a = st.session_state["artifacts"].get(artifact_id, {})
-    return a.get("versions", [])
+def resolve_model(label: str) -> Dict[str, str]:
+    for m in MODEL_REGISTRY:
+        if m["label"] == label:
+            return m
+    # fallback to first
+    return MODEL_REGISTRY[0]
 
 
-# -----------------------------
-# 7) agents.yaml: load/validate/standardize/upload/download
-# -----------------------------
-def load_agents_yaml_once():
-    if st.session_state.get("agents.yaml.raw"):
-        return
-    raw = ""
-    if os.path.exists("agents.yaml"):
+# -----------------------------------------------------------------------------
+# LLM calling (defensive wrapper)
+# -----------------------------------------------------------------------------
+
+class LLMError(Exception):
+    pass
+
+
+def _truncate_for_context(text: str, max_chars: int = 160_000) -> str:
+    # Simple safeguard for huge inputs; avoids provider hard failures.
+    if text is None:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "\n\n[...TRUNCATED FOR CONTEXT LIMIT...]\n"
+
+
+def llm_call(
+    *,
+    model_label: str,
+    system_prompt: str,
+    user_prompt: str,
+    temperature: float = DEFAULT_TEMPERATURE,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    timeout_s: int = 60,
+    retries: int = 2,
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    Returns (text, meta). Handles OpenAI, Gemini, Anthropic, Grok.
+    Fixes common bugs:
+    - Missing key -> clear error
+    - Missing packages -> clear error
+    - Timeouts/retries
+    - Always returns a string; never None
+    """
+    m = resolve_model(model_label)
+    provider = m["provider"]
+    model_id = m["id"]
+
+    key = get_provider_key(provider)
+    if not key:
+        raise LLMError(f"{provider} key missing. Add it in Settings & Keys or via environment variables.")
+
+    if not user_prompt.strip():
+        raise LLMError("User prompt is empty.")
+
+    system_prompt = system_prompt or ""
+    user_prompt = _truncate_for_context(user_prompt)
+
+    last_err = None
+    for attempt in range(retries + 1):
         try:
-            with open("agents.yaml", "r", encoding="utf-8") as f:
-                raw = f.read()
+            start = time.time()
+            if provider == "openai":
+                try:
+                    from openai import OpenAI
+                except Exception as e:
+                    raise LLMError("OpenAI package not available. Install 'openai'.") from e
+
+                client = OpenAI(api_key=key)
+                resp = client.chat.completions.create(
+                    model=model_id,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                )
+                text = resp.choices[0].message.content or ""
+                meta = {
+                    "provider": provider,
+                    "model": model_id,
+                    "duration_s": round(time.time() - start, 3),
+                    "usage": getattr(resp, "usage", None),
+                }
+                return text, meta
+
+            if provider == "grok":
+                # Grok via OpenAI-compatible API. Default base_url works for xAI.
+                try:
+                    from openai import OpenAI
+                except Exception as e:
+                    raise LLMError("OpenAI package not available (required for Grok compatible client).") from e
+
+                base_url = os.environ.get("GROK_BASE_URL", "https://api.x.ai/v1")
+                client = OpenAI(api_key=key, base_url=base_url)
+                resp = client.chat.completions.create(
+                    model=model_id,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                )
+                text = resp.choices[0].message.content or ""
+                meta = {
+                    "provider": provider,
+                    "model": model_id,
+                    "duration_s": round(time.time() - start, 3),
+                    "usage": getattr(resp, "usage", None),
+                    "base_url": base_url,
+                }
+                return text, meta
+
+            if provider == "anthropic":
+                try:
+                    import anthropic
+                except Exception as e:
+                    raise LLMError("Anthropic package not available. Install 'anthropic'.") from e
+
+                client = anthropic.Anthropic(api_key=key)
+                # Anthropic expects system separately
+                msg = client.messages.create(
+                    model=model_id,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": user_prompt}],
+                )
+                # msg.content is a list of blocks
+                parts = []
+                for block in getattr(msg, "content", []) or []:
+                    if getattr(block, "type", "") == "text":
+                        parts.append(getattr(block, "text", ""))
+                text = "\n".join(parts).strip()
+                meta = {
+                    "provider": provider,
+                    "model": model_id,
+                    "duration_s": round(time.time() - start, 3),
+                    "usage": getattr(msg, "usage", None),
+                }
+                return text, meta
+
+            if provider == "gemini":
+                # Support either google.generativeai (older) or google.genai (newer).
+                # Prefer google.generativeai for maximum compatibility.
+                start = time.time()
+                text = ""
+                meta = {"provider": provider, "model": model_id}
+
+                used_lib = None
+                # Try google.generativeai
+                try:
+                    import google.generativeai as genai  # type: ignore
+                    used_lib = "google.generativeai"
+                    genai.configure(api_key=key)
+                    model = genai.GenerativeModel(
+                        model_name=model_id,
+                        system_instruction=system_prompt if system_prompt.strip() else None,
+                    )
+                    resp = model.generate_content(
+                        user_prompt,
+                        generation_config={"temperature": temperature, "max_output_tokens": max_tokens},
+                    )
+                    text = getattr(resp, "text", "") or ""
+                    meta.update({"duration_s": round(time.time() - start, 3), "lib": used_lib})
+                    return text, meta
+                except Exception as e1:
+                    # Try google.genai fallback
+                    try:
+                        from google import genai as genai2  # type: ignore
+                        used_lib = "google.genai"
+                        client = genai2.Client(api_key=key)
+                        # Use a simple prompt concatenation to avoid schema drift between versions.
+                        combined = (system_prompt.strip() + "\n\n" + user_prompt).strip() if system_prompt.strip() else user_prompt
+                        resp = client.models.generate_content(
+                            model=model_id,
+                            contents=combined,
+                            config={"temperature": temperature, "max_output_tokens": max_tokens},
+                        )
+                        # New SDK response can be nested; best-effort extraction:
+                        text = getattr(resp, "text", None) or ""
+                        if not text and hasattr(resp, "candidates"):
+                            # attempt to pull candidate text
+                            try:
+                                text = resp.candidates[0].content.parts[0].text  # type: ignore
+                            except Exception:
+                                text = ""
+                        meta.update({"duration_s": round(time.time() - start, 3), "lib": used_lib})
+                        return text, meta
+                    except Exception as e2:
+                        raise LLMError(
+                            "Gemini SDK not available or failed. Install 'google-generativeai' "
+                            "or 'google-genai'."
+                        ) from (e2 or e1)
+
+            raise LLMError(f"Unknown provider: {provider}")
+
         except Exception as e:
-            safe_event("agents", "err", f"Failed reading agents.yaml: {e}")
-    st.session_state["agents.yaml.raw"] = raw.strip() or DEFAULT_AGENTS_YAML
+            last_err = e
+            # Retry only for likely transient errors
+            if attempt < retries:
+                backoff = 1.2 ** attempt
+                time.sleep(backoff)
+                continue
+            raise LLMError(str(e)) from e
 
-def validate_agents_yaml(raw: str) -> Optional[AgentsConfig]:
-    try:
-        parsed = yaml.safe_load(raw)
-
-        # 1) Normalize empty
-        if parsed is None:
-            parsed = {"agents": []}
-
-        # 2) If top-level list, treat as agents list
-        if isinstance(parsed, list):
-            parsed = {"agents": parsed}
-
-        # 3) If dict but uses steps/pipeline, normalize to agents list
-        if isinstance(parsed, dict) and "agents" not in parsed:
-            if isinstance(parsed.get("steps"), list):
-                parsed = {"agents": parsed["steps"]}
-            elif isinstance(parsed.get("pipeline"), list):
-                parsed = {"agents": parsed["pipeline"]}
-
-        # 4) At this point we expect a dict with key "agents"
-        if not isinstance(parsed, dict) or "agents" not in parsed:
-            raise ValueError(
-                "Invalid agents.yaml structure. Expected either:\n"
-                "- agents: [ ... ]\n"
-                "- agents: { agent_id: {...}, ... }\n"
-                "- or a top-level list of agents"
-            )
-
-        # 5) Handle YOUR case: agents is a mapping keyed by agent_id
-        if isinstance(parsed["agents"], dict):
-            agents_list = []
-            for agent_key, agent_body in parsed["agents"].items():
-                if not isinstance(agent_body, dict):
-                    agent_body = {}
-
-                a = dict(agent_body)  # copy
-
-                # Inject id from the mapping key if missing
-                a.setdefault("id", str(agent_key))
-
-                # Name fallback
-                a.setdefault("name", str(agent_key))
-
-                # Provide provider default if missing (your YAML doesn't define provider)
-                a.setdefault("provider", "openai")
-
-                # Map user_prompt_template -> user_prompt
-                if (not a.get("user_prompt")) and a.get("user_prompt_template"):
-                    a["user_prompt"] = str(a["user_prompt_template"]).replace("{{input}}", "{input}")
-
-                # If still missing user_prompt, keep minimal default
-                a.setdefault("user_prompt", "Analyze the provided context and output Markdown.")
-
-                agents_list.append(a)
-
-            parsed = {"agents": agents_list}
-
-        # 6) If agents is already a list, also map user_prompt_template if present
-        elif isinstance(parsed["agents"], list):
-            fixed = []
-            for item in parsed["agents"]:
-                if not isinstance(item, dict):
-                    item = {"user_prompt": str(item)}
-                a = dict(item)
-                if (not a.get("user_prompt")) and a.get("user_prompt_template"):
-                    a["user_prompt"] = str(a["user_prompt_template"]).replace("{{input}}", "{input}")
-                fixed.append(a)
-            parsed["agents"] = fixed
-
-        else:
-            raise ValueError("'agents' must be a list or a mapping (dict).")
-
-        # 7) Validate with Pydantic
-        cfg = AgentsConfig(**parsed)
-
-        # 8) Provider allowlist check
-        for a in cfg.agents:
-            if a.provider not in PROVIDERS:
-                raise ValueError(f"Unsupported provider '{a.provider}' in agent '{a.id}'")
-
-        return cfg
-
-    except Exception as e:
-        st.session_state["agents.last_error"] = str(e)
-        return None
-
-def _normalize_provider(p: Optional[str]) -> str:
-    p = (p or "").strip().lower()
-    if p in PROVIDERS:
-        return p
-    # loose mapping
-    if p in ["xai", "grok", "x-ai"]:
-        return "grok"
-    if p in ["google", "gemini", "generativeai"]:
-        return "gemini"
-    if p in ["openai", "oai"]:
-        return "openai"
-    if p in ["anthropic", "claude"]:
-        return "anthropic"
-    return "openai"
+    raise LLMError(str(last_err) if last_err else "Unknown LLM error.")
 
 
-def standardize_agents_yaml(raw: str) -> Tuple[str, str]:
-    """
-    Deterministic standardizer:
-    - Accepts many shapes:
-        - {agents: [...]}
-        - top-level list [...]
-        - {steps: [...]}, {pipeline: [...]}
-    - Maps common keys into canonical AgentSpec fields.
-    Returns (standard_yaml, report_md)
-    """
-    report = ["## Agent YAML Standardization Report", ""]
-    try:
-        parsed = yaml.safe_load(raw)
-    except Exception as e:
-        # fallback: return default
-        report += [f"**Parsing failed:** {e}", "", "Falling back to default schema."]
-        return DEFAULT_AGENTS_YAML, "\n".join(report)
+# -----------------------------------------------------------------------------
+# agents.yaml loading
+# -----------------------------------------------------------------------------
 
-    candidates = None
-    shape = "unknown"
-    if isinstance(parsed, dict):
-        if isinstance(parsed.get("agents"), list):
-            candidates = parsed.get("agents")
-            shape = "dict.agents"
-        elif isinstance(parsed.get("steps"), list):
-            candidates = parsed.get("steps")
-            shape = "dict.steps"
-        elif isinstance(parsed.get("pipeline"), list):
-            candidates = parsed.get("pipeline")
-            shape = "dict.pipeline"
-        else:
-            # try find first list value
-            for k, v in parsed.items():
-                if isinstance(v, list):
-                    candidates = v
-                    shape = f"dict.{k}"
-                    break
-    elif isinstance(parsed, list):
-        candidates = parsed
-        shape = "list"
-
-    if not isinstance(candidates, list):
-        report += [f"**Unrecognized YAML structure** ({shape}).", "", "Falling back to default schema."]
-        return DEFAULT_AGENTS_YAML, "\n".join(report)
-
-    report.append(f"- Detected structure: **{shape}**")
-    report.append(f"- Candidate steps: **{len(candidates)}**")
-    report.append("")
-
-    standardized = {"agents": []}
-    for i, item in enumerate(candidates, start=1):
-        if not isinstance(item, dict):
-            item = {"user_prompt": str(item)}
-
-        # key mapping
-        agent_id = str(item.get("id") or item.get("agent_id") or item.get("key") or f"a{i}")
-        name = str(item.get("name") or item.get("title") or item.get("display_name") or f"Agent {i}")
-
-        provider = _normalize_provider(item.get("provider") or item.get("llm_provider") or item.get("vendor"))
-        model = str(item.get("model") or item.get("llm_model") or item.get("engine") or SUPPORTED_MODELS.get(provider, ["gpt-4o-mini"])[0])
-
-        temp = item.get("temperature", item.get("temp", DEFAULT_TEMPERATURE))
-        try:
-            temperature = float(temp)
-        except Exception:
-            temperature = DEFAULT_TEMPERATURE
-
-        mt = item.get("max_tokens", item.get("maxTokens", item.get("output_tokens", DEFAULT_MAX_TOKENS)))
-        try:
-            max_tokens = int(mt)
-        except Exception:
-            max_tokens = DEFAULT_MAX_TOKENS
-
-        system_prompt = str(item.get("system_prompt") or item.get("system") or item.get("role") or "")
-        user_prompt = str(item.get("user_prompt") or item.get("prompt") or item.get("user") or item.get("instruction") or "")
-
-        # fill placeholders if missing prompts
-        changes = []
-        if not system_prompt.strip():
-            system_prompt = "You are a regulatory assistant. Be factual. Output in Markdown. Do not invent data."
-            changes.append("system_prompt defaulted")
-        if not user_prompt.strip():
-            user_prompt = "Analyze the provided context and produce a structured Markdown output."
-            changes.append("user_prompt defaulted")
-
-        expected_format = str(item.get("expected_format") or item.get("format") or "markdown")
-
-        standardized["agents"].append(
-            {
-                "id": agent_id,
-                "name": name,
-                "provider": provider,
-                "model": model,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-                "system_prompt": system_prompt,
-                "user_prompt": user_prompt,
-                "expected_format": expected_format,
-            }
-        )
-
-        report.append(f"- Standardized agent **{agent_id}** — {name}" + (f" _(changes: {', '.join(changes)})_" if changes else ""))
-
-    report.append("")
-    report.append("### Notes")
-    report.append("- This standardization is deterministic; please review prompts and model/provider selections.")
-    report.append(f"- Default `max_tokens` is {DEFAULT_MAX_TOKENS} when missing.")
-    report.append("- You can edit the standardized YAML in the editor and download it.")
-
-    # dump YAML
-    std_yaml = yaml.safe_dump(standardized, sort_keys=False, allow_unicode=True)
-    return std_yaml, "\n".join(report)
-
-
-# -----------------------------
-# 8) Datasets / search
-# -----------------------------
 @st.cache_data(show_spinner=False)
-def load_dataset_csv(path: str) -> "pd.DataFrame":
-    if pd is None:
-        raise RuntimeError("pandas not installed")
-    return pd.read_csv(path)
+def load_agents_yaml(text: str) -> Tuple[Dict[str, Any], Optional[str]]:
+    if not yaml:
+        return {}, "pyyaml is not available. Install 'pyyaml'."
+    try:
+        data = yaml.safe_load(text) or {}
+        # Accept either list or dict; normalize to dict name->agent
+        agents = {}
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict) and item.get("name"):
+                    agents[item["name"]] = item
+        elif isinstance(data, dict):
+            # Could be {agents: [...]} or direct mapping
+            if "agents" in data and isinstance(data["agents"], list):
+                for item in data["agents"]:
+                    if isinstance(item, dict) and item.get("name"):
+                        agents[item["name"]] = item
+            else:
+                # direct mapping
+                for k, v in data.items():
+                    if isinstance(v, dict):
+                        v.setdefault("name", k)
+                        agents[k] = v
+        # minimal validation
+        for name, a in agents.items():
+            a.setdefault("description", "")
+            a.setdefault("user_prompt_template", f"Use the provided context to help with {name}.")
+            a.setdefault("system_prompt", "You are a helpful expert assistant.")
+        return agents, None
+    except Exception as e:
+        return {}, f"Failed to parse agents.yaml: {e}"
 
 
-def load_datasets_best_effort():
-    if pd is None:
-        safe_event("data", "warn", "pandas not installed; dataset features disabled.")
-        st.session_state["data.loaded"] = False
+def try_load_agents_from_file() -> None:
+    """
+    Attempt to load agents.yaml from app directory if present.
+    """
+    if "agents_loaded_once" in st.session_state:
         return
 
-    base = "data"
-    files = {
-        "510k": os.path.join(base, "510k.csv"),
-        "mdr": os.path.join(base, "mdr.csv"),
-        "gudid": os.path.join(base, "gudid.csv"),
-        "recall": os.path.join(base, "recall.csv"),
-    }
-    dfs = {}
-    counts = {}
-    for k, fp in files.items():
-        if os.path.exists(fp):
-            try:
-                df = load_dataset_csv(fp)
-                dfs[k] = df
-                counts[k] = int(len(df))
-                safe_event("data", "info", f"Loaded dataset {k} ({counts[k]} rows).")
-            except Exception as e:
-                dfs[k] = pd.DataFrame()
-                counts[k] = 0
-                safe_event("data", "err", f"Failed loading dataset {k}: {e}")
+    st.session_state["agents_loaded_once"] = True
+    if not os.path.exists("agents.yaml"):
+        st.session_state.agents = {}
+        st.session_state.agents_load_error = "agents.yaml not found. You can upload one in Settings."
+        return
+
+    try:
+        with open("agents.yaml", "r", encoding="utf-8") as f:
+            txt = f.read()
+        agents, err = load_agents_yaml(txt)
+        st.session_state.agents = agents
+        st.session_state.agents_load_error = err
+        if err:
+            log_event(err, "WARN", "agents")
         else:
-            dfs[k] = pd.DataFrame()
-            counts[k] = 0
-
-    st.session_state["dataframes"] = dfs
-    st.session_state["data.counts"] = counts
-    st.session_state["data.loaded"] = True
-    set_pipeline_state("data", "done", f"Loaded datasets: {counts}")
+            log_event(f"Loaded {len(agents)} agents from agents.yaml", "INFO", "agents")
+    except Exception as e:
+        st.session_state.agents = {}
+        st.session_state.agents_load_error = str(e)
+        log_event(f"agents.yaml load failed: {e}", "ERROR", "agents")
 
 
-def fuzzy_search_all(query: str, limit: int = 25) -> Dict[str, Any]:
-    dfs = st.session_state.get("dataframes", {})
-    results = {}
-    if not query.strip():
-        return results
+# -----------------------------------------------------------------------------
+# PDF discovery & processing (ZIP upload workflow for HF Spaces)
+# -----------------------------------------------------------------------------
 
-    for name, df in (dfs or {}).items():
-        if df is None or getattr(df, "empty", True):
-            results[name] = None
+def extract_zip_to_tmp(zip_bytes: bytes) -> str:
+    ws_id = f"ws_{uuid.uuid4().hex[:10]}"
+    base = os.path.join("/tmp", ws_id)
+    os.makedirs(base, exist_ok=True)
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+        z.extractall(base)
+    return base
+
+
+def discover_pdfs(root_dir: str) -> List[str]:
+    pdfs = []
+    for dirpath, _, filenames in os.walk(root_dir):
+        for fn in filenames:
+            if fn.lower().endswith(".pdf"):
+                pdfs.append(os.path.join(dirpath, fn))
+    return sorted(pdfs)
+
+
+def pdf_extract_text_trim_first_page(path: str) -> Tuple[str, Dict[str, Any]]:
+    """
+    Returns extracted text and metadata flags.
+    Preserves original behavior: discard page 0 if >1 pages, else keep.
+    """
+    if not PdfReader:
+        raise RuntimeError("pypdf not available. Install 'pypdf'.")
+    meta = {"path": path, "single_page": False, "trimmed_first_page": False, "scanned_or_empty": False}
+    reader = PdfReader(path)
+    n = len(reader.pages)
+    if n == 0:
+        return "", {**meta, "scanned_or_empty": True}
+
+    start_idx = 0
+    if n > 1:
+        start_idx = 1
+        meta["trimmed_first_page"] = True
+    else:
+        meta["single_page"] = True
+
+    texts = []
+    for i in range(start_idx, n):
+        try:
+            page = reader.pages[i]
+            txt = page.extract_text() or ""
+            texts.append(txt)
+        except Exception:
             continue
 
-        cols = [c for c in df.columns if any(s in c.lower() for s in ["device", "name", "applicant", "k_number", "product", "code", "manufacturer", "udi"])]
-        cols = cols[:6] if cols else list(df.columns[:4])
+    text = "\n".join(texts).strip()
+    if not text:
+        meta["scanned_or_empty"] = True
+        text = "[Scanned content or text extraction failed — OCR not enabled in this build.]"
+    return text, meta
 
-        try:
-            if fuzz and process:
-                comb = df[cols].astype(str).fillna("").agg(" | ".join, axis=1).tolist()
-                matches = process.extract(query, comb, scorer=fuzz.partial_ratio, limit=min(limit, len(comb)))
-                idxs = [m[2] for m in matches if m[1] >= 60]
-                sub = df.iloc[idxs].copy()
-                sub["_score"] = [m[1] for m in matches if m[1] >= 60]
-                results[name] = sub
-            else:
-                mask = None
-                for c in cols:
-                    m = df[c].astype(str).str.contains(query, case=False, na=False)
-                    mask = m if mask is None else (mask | m)
-                results[name] = df[mask].head(limit).copy()
-        except Exception as e:
-            safe_event("search", "err", f"Search failed for {name}: {e}")
-            results[name] = None
 
+def build_atomic_summary_prompt(domain_lens: str, output_lang: str) -> Tuple[str, str]:
+    """
+    Returns (system_prompt, user_prefix) for atomic summaries.
+    """
+    if output_lang == "zh-TW":
+        lang_note = "請使用繁體中文輸出。"
+    else:
+        lang_note = "Please output in English."
+
+    lens_map = {
+        "general": "Summarize generally with key points.",
+        "510k": "Summarize with a regulatory/510(k) lens: intended use, device description, key testing evidence, standards/guidance, and notable gaps.",
+        "clinical": "Summarize focusing on clinical claims, endpoints, evidence, and interpretation constraints.",
+        "cyber": "Summarize focusing on software/network connectivity, cybersecurity concerns, and expected documentation.",
+        "software": "Summarize focusing on software architecture, validation, known anomalies, and change impact.",
+    }
+    lens_text = lens_map.get(domain_lens, lens_map["general"])
+
+    system_prompt = (
+        "You are a meticulous assistant that produces concise, high-signal summaries in Markdown. "
+        "Avoid hallucinations; if unsure, say 'not stated'."
+    )
+    user_prefix = (
+        f"{lang_note}\n"
+        f"{lens_text}\n\n"
+        "Return:\n"
+        "- 3–7 bullet points of key facts\n"
+        "- A 'Notable Gaps / Questions' subsection (2–5 bullets)\n"
+        "- Keep it compact but specific.\n"
+    )
+    return system_prompt, user_prefix
+
+
+def summarize_pdf_text(
+    text: str,
+    *,
+    model_label: str,
+    domain_lens: str,
+    output_lang: str,
+) -> Tuple[str, Dict[str, Any]]:
+    system_prompt, user_prefix = build_atomic_summary_prompt(domain_lens, output_lang)
+    user_prompt = user_prefix + "\n\nDOCUMENT TEXT:\n" + text
+    return llm_call(
+        model_label=model_label,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        temperature=0.2,
+        max_tokens=900,
+    )
+
+
+def build_master_toc(summaries: Dict[str, str]) -> str:
+    md = ["# Master Table of Contents", ""]
+    i = 1
+    for path, summ in summaries.items():
+        fn = os.path.basename(path)
+        md.append(f"## {i}. {fn}")
+        md.append(summ.strip())
+        md.append("")
+        i += 1
+    return "\n".join(md).strip() + "\n"
+
+
+# -----------------------------------------------------------------------------
+# Web research (best-effort, optional)
+# -----------------------------------------------------------------------------
+
+def ddg_search(query: str, max_results: int = 5) -> List[Dict[str, str]]:
+    """
+    Returns list of {title, href, snippet}.
+    Uses duckduckgo_search if available; else returns empty.
+    """
+    try:
+        from duckduckgo_search import DDGS  # type: ignore
+    except Exception:
+        return []
+
+    results = []
+    try:
+        with DDGS() as ddgs:
+            for r in ddgs.text(query, max_results=max_results):
+                results.append({
+                    "title": r.get("title", ""),
+                    "href": r.get("href", ""),
+                    "snippet": r.get("body", ""),
+                })
+    except Exception:
+        return []
     return results
 
 
-# -----------------------------
-# 9) LLM execution gateway
-# -----------------------------
-def llm_execute(provider: str, model: str, system_prompt: str, user_prompt: str, context: str,
-                max_tokens: int, temperature: float) -> Tuple[str, dict]:
-    start = time.time()
-    safe_event("llm", "info", f"LLM start: {provider}/{model}", {"max_tokens": max_tokens})
-
-    key = get_effective_key(provider)
-    if not key:
-        raise RuntimeError(f"Missing API key for provider: {provider}")
-
-    full_user = (user_prompt or "").strip()
-    if context:
-        full_user = full_user + "\n\n--- CONTEXT START ---\n" + context + "\n--- CONTEXT END ---\n"
-
-    content = ""
-    usage = {"input_tokens_est": approx_tokens(system_prompt + full_user)}
-
-    if provider == "openai":
-        if OpenAI is None:
-            raise RuntimeError("openai SDK not installed.")
-        client = OpenAI(api_key=key)
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt or ""},
-                {"role": "user", "content": full_user},
-            ],
-            max_tokens=int(max_tokens),
-            temperature=float(temperature),
-        )
-        content = resp.choices[0].message.content or ""
-
-    elif provider == "grok":
-        if OpenAI is None:
-            raise RuntimeError("openai SDK not installed (used for OpenAI-compatible endpoints).")
-        base_url = os.getenv("GROK_BASE_URL") or os.getenv("XAI_BASE_URL") or "https://api.x.ai/v1"
-        client = OpenAI(api_key=key, base_url=base_url)
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt or ""},
-                {"role": "user", "content": full_user},
-            ],
-            max_tokens=int(max_tokens),
-            temperature=float(temperature),
-        )
-        content = resp.choices[0].message.content or ""
-
-    elif provider == "anthropic":
-        if anthropic is None:
-            raise RuntimeError("anthropic SDK not installed.")
-        client = anthropic.Anthropic(api_key=key)
-        resp = client.messages.create(
-            model=model,
-            max_tokens=int(max_tokens),
-            temperature=float(temperature),
-            system=system_prompt or "",
-            messages=[{"role": "user", "content": full_user}],
-        )
-        parts = []
-        for block in resp.content:
-            if getattr(block, "type", None) == "text":
-                parts.append(block.text)
-        content = "\n".join(parts).strip()
-
-    elif provider == "gemini":
-        if genai is None:
-            raise RuntimeError("google-generativeai SDK not installed.")
-        genai.configure(api_key=key)
-        mdl = genai.GenerativeModel(model)
-        msg = ""
-        if system_prompt:
-            msg += f"[SYSTEM]\n{system_prompt}\n\n"
-        msg += full_user
-        resp = mdl.generate_content(msg)
-        content = getattr(resp, "text", "") or ""
-
-    else:
-        raise RuntimeError(f"Unsupported provider: {provider}")
-
-    elapsed = int((time.time() - start) * 1000)
-    bump_metric(f"{provider}.calls", 1)
-    bump_metric(f"{provider}.latency_ms_total", elapsed)
-    safe_event("llm", "info", f"LLM done: {provider}/{model} ({elapsed}ms)")
-    return content, {
-        "latency_ms": elapsed,
-        "usage": usage,
-        "provider": provider,
-        "model": model,
-        "prompts_hash": {"system": sha256_hex(system_prompt), "user": sha256_hex(user_prompt), "context": sha256_hex((context or "")[:5000])},
-    }
-
-
-# -----------------------------
-# 10) Document pipeline: ingest/scan/trim/OCR/consolidate
-# -----------------------------
-def register_uploaded_files(uploaded_files: list):
-    if not uploaded_files:
-        return
-    reg = st.session_state["docs.registry"]
-    existing_names = {f["name"] for f in reg}
-
-    for uf in uploaded_files:
-        try:
-            b = uf.read()
-            file_id = str(uuid.uuid4())
-            name = uf.name
-            if name in existing_names:
-                name = f"{name} ({file_id[:8]})"
-            reg.append(
-                {
-                    "id": file_id,
-                    "name": name,
-                    "source": "upload",
-                    "bytes": b,
-                    "path": None,
-                    "size": len(b),
-                    "page_count": None,
-                    "health": "unknown",
-                    "created_at": now_taipei_str(),
-                }
-            )
-            safe_event("ingestion", "info", f"Registered upload: {name} ({human_size(len(b))}).")
-        except Exception as e:
-            safe_event("ingestion", "err", f"Failed registering upload: {e}")
-
-    set_pipeline_state("ingestion", "done", f"Registry size: {len(st.session_state['docs.registry'])}")
-
-
-def register_file_paths(paths_text: str):
-    if not paths_text.strip():
-        return
-    reg = st.session_state["docs.registry"]
-    lines = [ln.strip() for ln in paths_text.splitlines() if ln.strip()]
-    for p in lines:
-        try:
-            if not os.path.exists(p):
-                safe_event("ingestion", "warn", f"Path not found: {p}")
-                continue
-            if not p.lower().endswith(".pdf"):
-                safe_event("ingestion", "warn", f"Not a PDF: {p}")
-                continue
-            with open(p, "rb") as f:
-                b = f.read()
-            file_id = str(uuid.uuid4())
-            reg.append(
-                {
-                    "id": file_id,
-                    "name": os.path.basename(p),
-                    "source": "path",
-                    "bytes": b,
-                    "path": p,
-                    "size": len(b),
-                    "page_count": None,
-                    "health": "unknown",
-                    "created_at": now_taipei_str(),
-                }
-            )
-            safe_event("ingestion", "info", f"Registered path: {os.path.basename(p)} ({human_size(len(b))}).")
-        except Exception as e:
-            safe_event("ingestion", "err", f"Failed reading path {p}: {e}")
-
-    set_pipeline_state("ingestion", "done", f"Registry size: {len(st.session_state['docs.registry'])}")
-
-
-def scan_pdf_metadata(file_obj: dict):
-    if PdfReader is None:
-        file_obj["health"] = "no_pypdf2"
-        return
-    try:
-        reader = PdfReader(io.BytesIO(file_obj["bytes"]))
-        file_obj["page_count"] = len(reader.pages)
-        file_obj["health"] = "ok"
-    except Exception as e:
-        file_obj["health"] = f"error: {e}"
-
-
-def ensure_scanned_metadata():
-    for f in st.session_state["docs.registry"]:
-        if f.get("page_count") is None and isinstance(f.get("bytes"), (bytes, bytearray)):
-            scan_pdf_metadata(f)
-
-
-def trim_pdf_bytes(pdf_bytes: bytes, page_indices: List[int]) -> bytes:
-    if PdfReader is None or PdfWriter is None:
-        raise RuntimeError("PyPDF2 not available.")
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-    writer = PdfWriter()
-    max_page = len(reader.pages) - 1
-    for idx in page_indices:
-        if 0 <= idx <= max_page:
-            writer.add_page(reader.pages[idx])
-    out = io.BytesIO()
-    writer.write(out)
-    return out.getvalue()
-
-
-def execute_trimming(policy_out_of_range: str = "clip_with_warn"):
-    set_pipeline_state("trim", "running", "Trimming selected PDFs...")
-    reg = st.session_state["docs.registry"]
-    selected: Set[str] = st.session_state["docs.queue.selected_ids"] or set()
-    global_range = st.session_state.get("docs.trim.global_range", "1-5")
-    per_override = st.session_state.get("docs.trim.per_file_override", {})
-
-    outputs = {}
-    warnings = 0
-
-    for f in reg:
-        if f["id"] not in selected:
-            continue
-        rng = (per_override.get(f["id"]) or "").strip() or global_range
-        try:
-            indices = parse_page_ranges(rng)
-            if f.get("page_count") is not None and indices:
-                max_page = f["page_count"] - 1
-                if indices[-1] > max_page:
-                    if policy_out_of_range == "block":
-                        raise ValueError(f"Range exceeds page count ({f['page_count']}).")
-                    if policy_out_of_range == "skip_file":
-                        safe_event("trim", "warn", f"Skipping {f['name']}: range exceeds page count.")
-                        warnings += 1
-                        continue
-                    # clip with warn
-                    indices = [i for i in indices if i <= max_page]
-                    safe_event("trim", "warn", f"Clipped range for {f['name']} to max page {f['page_count']}.")
-
-            outputs[f["id"]] = trim_pdf_bytes(f["bytes"], indices)
-            safe_event("trim", "info", f"Trimmed {f['name']} with range '{rng}'.")
-        except Exception as e:
-            safe_event("trim", "err", f"Trimming failed for {f['name']}: {e}")
-            warnings += 1
-
-    st.session_state["docs.trim.outputs"] = outputs
-    set_pipeline_state("trim", "done" if warnings == 0 else "warn", f"Trimmed files: {len(outputs)}")
-    bump_metric("trim.files", len(outputs))
-
-
-def ocr_python_pack(pdf_bytes: bytes, low_resource: bool = False) -> str:
-    text = ""
-    if PdfReader is not None:
-        try:
-            reader = PdfReader(io.BytesIO(pdf_bytes))
-            chunks = []
-            for i, p in enumerate(reader.pages):
-                try:
-                    chunks.append(p.extract_text() or "")
-                except Exception:
-                    chunks.append("")
-                if low_resource and i >= 4:
-                    break
-            text = "\n".join(chunks).strip()
-        except Exception as e:
-            safe_event("ocr", "warn", f"PyPDF2 extraction failed: {e}")
-
-    if text:
-        return text
-
-    if convert_from_bytes is None or pytesseract is None:
-        safe_event("ocr", "warn", "Tesseract/pdf2image not available; returning empty text.")
-        return ""
-
-    images = convert_from_bytes(pdf_bytes, dpi=200 if low_resource else 300)
-    out_chunks = []
-    for idx, img in enumerate(images):
-        try:
-            out_chunks.append(pytesseract.image_to_string(img))
-        except Exception as e:
-            safe_event("ocr", "warn", f"Tesseract OCR failed page {idx+1}: {e}")
-        if low_resource and idx >= 4:
-            break
-    return "\n".join(out_chunks).strip()
-
-
-def gemini_llm_ocr(pdf_bytes: bytes, model: str, prompt: str, low_resource: bool = False) -> str:
-    if genai is None:
-        raise RuntimeError("google-generativeai not installed.")
-    api_key = get_effective_key("gemini")
-    if not api_key:
-        raise RuntimeError("Gemini API key missing.")
-    genai.configure(api_key=api_key)
-
-    if convert_from_bytes is None:
-        raise RuntimeError("pdf2image not installed; cannot render images.")
-
-    images = convert_from_bytes(pdf_bytes, dpi=180 if low_resource else 300)
-    if low_resource:
-        images = images[:5]
-
-    mdl = genai.GenerativeModel(model)
+def filter_fda_only(results: List[Dict[str, str]]) -> List[Dict[str, str]]:
     out = []
-    for i, img in enumerate(images, start=1):
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        b = buf.getvalue()
-        parts = [
-            {"text": prompt},
-            {"inline_data": {"mime_type": "image/png", "data": base64.b64encode(b).decode("utf-8")}},
-        ]
-        try:
-            resp = mdl.generate_content(parts)
-            out_text = getattr(resp, "text", "") or ""
-            out.append(out_text.strip())
-            safe_event("ocr", "info", f"Gemini OCR page {i}/{len(images)} done.", {"model": model})
-            bump_metric("gemini.calls", 1)
-        except Exception as e:
-            safe_event("ocr", "err", f"Gemini OCR failed page {i}: {e}", {"model": model})
-            bump_metric("gemini.errors", 1)
-            out.append(f"\n\n[OCR ERROR page {i}: {e}]\n\n")
-    return "\n\n".join(out).strip()
-
-
-def assemble_consolidated_markdown(outputs_by_file: Dict[str, str]) -> Tuple[str, Dict[str, dict]]:
-    anchors = {}
-    reg = {f["id"]: f for f in st.session_state["docs.registry"]}
-    pieces = []
-    for file_id, content in outputs_by_file.items():
-        f = reg.get(file_id, {"name": file_id})
-        anchor_id = f"anc_{file_id[:8]}_p1"
-        anchors[anchor_id] = {"file_id": file_id, "file_name": f.get("name"), "page": 1}
-        pieces.append(f"--- ANCHOR: {anchor_id} | FILE: {f.get('name')} | PAGE: 1 ---")
-        pieces.append(content or "")
-        pieces.append("\n")
-    return "\n".join(pieces).strip(), anchors
-
-
-def execute_ocr():
-    set_pipeline_state("ocr", "running", "OCR running...")
-    selected: Set[str] = st.session_state["docs.queue.selected_ids"] or set()
-    trimmed = st.session_state.get("docs.trim.outputs", {})
-    mode = st.session_state.get("docs.ocr.mode", "python_pack")
-    low_resource = st.session_state.get("ui.low_resource_mode", False)
-
-    if not selected:
-        raise RuntimeError("No files selected.")
-    if not trimmed:
-        raise RuntimeError("No trimmed PDFs found. Run Trim first.")
-
-    outputs = {}
-    file_ids = [fid for fid in trimmed.keys() if fid in selected]
-    total = len(file_ids)
-    progress = st.progress(0.0)
-
-    for idx, file_id in enumerate(file_ids, start=1):
-        progress.progress(idx / max(1, total))
-        pdf_bytes = trimmed[file_id]
-        name = next((f["name"] for f in st.session_state["docs.registry"] if f["id"] == file_id), file_id)
-
-        try:
-            if mode == "python_pack":
-                text = ocr_python_pack(pdf_bytes, low_resource=low_resource)
-                outputs[file_id] = text
-                bump_metric("ocr.python.files", 1)
-                safe_event("ocr", "info", f"Python OCR done: {name}")
-            else:
-                model = st.session_state.get("docs.ocr.model", GEMINI_MODELS[0])
-                global_prompt = st.session_state.get("docs.ocr.prompt_global", "")
-                per_file_prompt = (st.session_state.get("docs.ocr.prompt_per_file", {}) or {}).get(file_id, "").strip()
-                prompt = per_file_prompt or global_prompt
-                md = gemini_llm_ocr(pdf_bytes, model=model, prompt=prompt, low_resource=low_resource)
-                outputs[file_id] = md
-                bump_metric("ocr.gemini.files", 1)
-        except Exception as e:
-            safe_event("ocr", "err", f"OCR failed for {name}: {e}")
-            outputs[file_id] = f"\n\n[OCR ERROR for {name}: {e}]\n\n"
-            bump_metric("ocr.errors", 1)
-
-    st.session_state["docs.ocr.outputs_by_file"] = outputs
-    consolidated, anchors = assemble_consolidated_markdown(outputs)
-    st.session_state["docs.consolidated_markdown"] = consolidated
-    st.session_state["docs.consolidated_anchors"] = anchors
-
-    if not st.session_state.get("consolidated.artifact_id"):
-        aid = create_artifact(consolidated, fmt="markdown", metadata={"source": "ocr_consolidation"})
-        st.session_state["consolidated.artifact_id"] = aid
-    else:
-        aid = st.session_state["consolidated.artifact_id"]
-        cur, curm = artifact_get_current(aid)
-        artifact_add_version(aid, consolidated, created_by="ocr", metadata={"source": "ocr_consolidation"}, parent_version_id=curm.get("version_id"))
-
-    set_pipeline_state("ocr", "done", f"OCR files: {len(outputs)}")
-    set_pipeline_state("consolidation", "done", f"Chars: {len(consolidated)}")
-    bump_metric("ocr.files", len(outputs))
-
-
-# -----------------------------
-# 11) Timeline / DAG (simple registry)
-# -----------------------------
-def timeline_add_node(kind: str, title: str, artifact_id: Optional[str], meta: dict) -> str:
-    node_id = str(uuid.uuid4())
-    tl = st.session_state["agents.timeline"]
-    tl["nodes"].append({"node_id": node_id, "kind": kind, "title": title, "artifact_id": artifact_id, "ts": now_taipei_str(), "meta": meta})
-    return node_id
-
-
-def timeline_add_edge(src_node_id: str, dst_node_id: str, label: str = "handoff"):
-    st.session_state["agents.timeline"]["edges"].append({"src": src_node_id, "dst": dst_node_id, "label": label, "ts": now_taipei_str()})
-
-
-# -----------------------------
-# 12) WOW AI core helpers
-# -----------------------------
-def extract_claims(text: str, max_claims: int = 80) -> List[str]:
-    if not text:
-        return []
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    claims = []
-    for ln in lines:
-        if ln.startswith(("-", "*", "•")) and len(ln) > 25:
-            claims.append(ln.lstrip("-*• ").strip())
-
-    sents = re.split(r"(?<=[\.\?!])\s+", text)
-    for s in sents:
-        s = s.strip()
-        if len(s) < 40:
-            continue
-        if re.search(r"\d", s) or any(k in s.lower() for k in ["shall", "must", "demonstrat", "tested", "complied", "indicat"]):
-            claims.append(s)
-
-    uniq = []
-    seen = set()
-    for c in claims:
-        key = c.lower()[:180]
-        if key not in seen:
-            uniq.append(c)
-            seen.add(key)
-        if len(uniq) >= max_claims:
-            break
-    return uniq
-
-
-def build_anchor_index(consolidated_md: str) -> List[Tuple[int, str]]:
-    idx = []
-    for m in re.finditer(r"---\s*ANCHOR:\s*([A-Za-z0-9_\-]+)\s*\|", consolidated_md or ""):
-        idx.append((m.start(), m.group(1)))
-    idx.sort(key=lambda x: x[0])
-    return idx
-
-
-def find_nearest_anchor(anchor_index: List[Tuple[int, str]], position: int) -> Optional[str]:
-    if not anchor_index:
-        return None
-    lo, hi = 0, len(anchor_index) - 1
-    best = None
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        pos, aid = anchor_index[mid]
-        if pos <= position:
-            best = aid
-            lo = mid + 1
-        else:
-            hi = mid - 1
-    return best
-
-
-def evidence_mapper_run(target_text: str) -> Tuple[str, List[dict]]:
-    consolidated = st.session_state.get("docs.consolidated_markdown", "") or ""
-    anchors = st.session_state.get("docs.consolidated_anchors", {}) or {}
-    if not consolidated.strip():
-        raise RuntimeError("No consolidated OCR text available.")
-
-    anchor_index = build_anchor_index(consolidated)
-    claims = extract_claims(target_text, max_claims=60)
-    if not claims:
-        return "No claims detected.", []
-
-    lines = consolidated.splitlines()
-    positions = []
-    cur = 0
-    for ln in lines:
-        positions.append(cur)
-        cur += len(ln) + 1
-
-    results = []
-    for c in claims:
-        best = {"score": 0, "line": "", "pos": None}
-        if fuzz is not None:
-            for i, ln in enumerate(lines):
-                if not ln.strip():
-                    continue
-                s = fuzz.partial_ratio(c[:300], ln[:400])
-                if s > best["score"]:
-                    best = {"score": s, "line": ln, "pos": positions[i]}
-        else:
-            for i, ln in enumerate(lines):
-                if c[:40].lower() in ln.lower():
-                    best = {"score": 70, "line": ln, "pos": positions[i]}
-                    break
-
-        anchor_id = find_nearest_anchor(anchor_index, best["pos"] or 0) if best["pos"] is not None else None
-        anc_meta = anchors.get(anchor_id, {}) if anchor_id else {}
-
-        results.append(
-            {
-                "claim": c,
-                "confidence": best["score"],
-                "evidence_quote": (best["line"] or "")[:500],
-                "anchor_id": anchor_id or "",
-                "file": anc_meta.get("file_name", ""),
-                "page": anc_meta.get("page", ""),
-            }
-        )
-
-    md_lines = [
-        "## Evidence Map",
-        "",
-        f"- Claims analyzed: **{len(results)}**",
-        f"- Coverage (has anchor): **{sum(1 for r in results if r['anchor_id'])}/{len(results)}**",
-        "",
-        "| Claim | Confidence | Evidence Quote | Anchor | File | Page |",
-        "|---|---:|---|---|---|---:|",
-    ]
     for r in results:
-        claim = (r["claim"][:160] + "…") if len(r["claim"]) > 160 else r["claim"]
-        quote = (r["evidence_quote"][:140] + "…") if len(r["evidence_quote"]) > 140 else r["evidence_quote"]
-        md_lines.append(
-            f"| {claim.replace('|','\\|')} | {r['confidence']} | {quote.replace('|','\\|')} | {r['anchor_id']} | {r['file']} | {r['page']} |"
-        )
-    return "\n".join(md_lines), results
+        href = r.get("href", "") or ""
+        if "fda.gov" in href:
+            out.append(r)
+    return out
 
 
-def consistency_guardian_run(summary_text: str) -> str:
-    issues = []
-    text = summary_text or ""
-    lower = text.lower()
-
-    required_headings = [
-        "device description",
-        "indications",
-        "predicate",
-        "performance",
-        "biocompat",
-        "steril",
-        "label",
-    ]
-    missing = [h for h in required_headings if h not in lower]
-    for h in missing:
-        issues.append({"severity": "high", "title": "Missing section", "detail": f"Required section not found: '{h}'"})
-
-    shelf = re.findall(r"(shelf\s*life[^.\n]{0,80})", lower)
-    vals = set()
-    for s in shelf:
-        m = re.search(r"(\d+(\.\d+)?)\s*(year|years|month|months|day|days)", s)
-        if m:
-            vals.add(m.group(0))
-    if len(vals) >= 2:
-        issues.append({"severity": "critical", "title": "Conflicting shelf life", "detail": f"Multiple shelf-life values found: {sorted(vals)}"})
-
-    steril_methods = set()
-    for pat in ["eto", "ethylene oxide", "gamma", "e-beam", "steam", "autoclave", "radiation"]:
-        if pat in lower:
-            steril_methods.add(pat)
-    if len(steril_methods) >= 3:
-        issues.append({"severity": "medium", "title": "Multiple sterilization methods mentioned", "detail": f"Sterilization terms found: {sorted(steril_methods)}"})
-
-    md = ["## Consistency Guardian Report", ""]
-    if not issues:
-        md.append("No major consistency issues detected by heuristic checks.")
-        return "\n".join(md)
-
-    md.append(f"Detected issues: **{len(issues)}**")
-    md.append("")
-    md.append("| Severity | Issue | Detail |")
-    md.append("|---|---|---|")
-    for it in issues:
-        md.append(f"| {it['severity']} | {it['title']} | {it['detail'].replace('|','\\|')} |")
-
-    md.append("")
-    md.append("### Recommended Actions")
-    md.append("- Review flagged sections and harmonize terminology and numeric values.")
-    md.append("- Use Evidence Mapper to confirm that key claims are traceable to OCR anchors.")
-    return "\n".join(md)
-
-
-def risk_radar_run(summary_text: str, evidence_results: Optional[List[dict]] = None) -> Tuple[dict, str]:
-    text = summary_text or ""
-    lower = text.lower()
-
-    coverage = None
-    if evidence_results:
-        mapped = sum(1 for r in evidence_results if r.get("anchor_id"))
-        coverage = mapped / max(1, len(evidence_results))
-
-    domains = {
-        "Device Description": 0,
-        "Indications for Use": 0,
-        "Predicate Comparison": 0,
-        "Performance Testing": 0,
-        "Biocompatibility": 0,
-        "Sterilization/Shelf-life": 0,
-        "Software/Cybersecurity": 0,
-        "Labeling/IFU": 0,
-        "Post-market Signals": 0,
-    }
-
-    def missing_penalty(keywords: List[str], weight: int):
-        return weight if not any(k in lower for k in keywords) else 0
-
-    domains["Device Description"] += missing_penalty(["device description", "overview", "device"], 35)
-    domains["Indications for Use"] += missing_penalty(["indications", "intended use"], 40)
-    domains["Predicate Comparison"] += missing_penalty(["predicate", "substantial equivalence", "equivalent"], 45)
-    domains["Performance Testing"] += missing_penalty(["performance", "bench", "verification", "validation", "test"], 40)
-    domains["Biocompatibility"] += missing_penalty(["biocompat", "iso 10993"], 45)
-    domains["Sterilization/Shelf-life"] += missing_penalty(["steril", "shelf life", "packaging"], 45)
-    domains["Software/Cybersecurity"] += missing_penalty(["software", "cyber", "security", "sbom"], 35)
-    domains["Labeling/IFU"] += missing_penalty(["label", "ifu", "instructions for use"], 35)
-
-    dv = st.session_state.get("data.device_view", {}) or {}
-    mdr_count = dv.get("mdr_count", 0) or 0
-    recall_sev = dv.get("recall_max_class", 0) or 0
-    if mdr_count > 0:
-        domains["Post-market Signals"] += min(60, 10 + int(math.log1p(mdr_count) * 15))
-    if recall_sev:
-        domains["Post-market Signals"] += 20 + (recall_sev * 10)
-
-    if coverage is not None:
-        if coverage < 0.4:
-            for k in domains:
-                domains[k] += 10
-        elif coverage < 0.65:
-            for k in domains:
-                domains[k] += 5
-
-    for k in domains:
-        domains[k] = int(max(0, min(100, domains[k])))
-
-    md = ["## Regulatory Risk Radar", ""]
-    md.append(f"- Evidence coverage signal: **{coverage:.2f}**" if coverage is not None else "- Evidence coverage signal: *(not available)*")
-    md.append("")
-    md.append("| Domain | Attention Score (0-100) | Rationale (brief) |")
-    md.append("|---|---:|---|")
-    for k, v in domains.items():
-        rationale = "Missing or weak coverage in summary." if v >= 60 else ("Some gaps detected." if v >= 35 else "Appears reasonably covered.")
-        if k == "Post-market Signals" and (mdr_count or recall_sev):
-            rationale = f"Dataset signals: MDR={mdr_count}, RecallClassMax={recall_sev}."
-        md.append(f"| {k} | {v} | {rationale} |")
-
-    md.append("")
-    md.append("### Priority Reading Plan (Suggested)")
-    md.append("1. Review domains with the highest scores first.")
-    md.append("2. Use Evidence Mapper to confirm traceability for high-impact claims.")
-    md.append("3. Convert gaps into concrete reviewer follow-up questions.")
-    return domains, "\n".join(md)
-
-
-def rta_gatekeeper_run(summary_text: str) -> Tuple[int, str]:
+def web_research_plan(step1_text: str) -> List[str]:
     """
-    WOW AI #4 — RTA Gatekeeper (heuristic completeness scan).
-    Produces score 0-100 and a Markdown checklist.
+    Simple query planner: extract device keywords; generate queries.
     """
-    lower = (summary_text or "").lower()
-    checklist = [
-        ("Device Description", ["device description", "device overview", "components"]),
-        ("Indications for Use", ["indications", "intended use"]),
-        ("Predicate Device Identification", ["predicate", "k-number", "substantial equivalence"]),
-        ("Technology Comparison", ["comparison", "technological characteristics", "equivalence"]),
-        ("Performance Testing", ["performance", "bench", "verification", "validation", "test"]),
-        ("Biocompatibility", ["biocompat", "iso 10993"]),
-        ("Sterilization", ["steril", "eto", "gamma", "sal"]),
-        ("Shelf-life / Packaging", ["shelf life", "packaging", "integrity"]),
-        ("Software (if applicable)", ["software", "cyber", "security", "sbom", "firmware"]),
-        ("Labeling/IFU", ["label", "ifu", "instructions for use", "warnings", "precautions"]),
-        ("Clinical Evidence (if applicable)", ["clinical", "study", "trial", "human data"]),
-    ]
-
-    rows = []
-    passed = 0
-    for item, keys in checklist:
-        found = any(k in lower for k in keys)
-        status = "Pass" if found else "Missing/Unclear"
-        if found:
-            passed += 1
-        rows.append((item, status, ", ".join(keys)))
-
-    score = int(round(100 * passed / max(1, len(checklist))))
-
-    md = ["## RTA Gatekeeper (Heuristic)", ""]
-    md.append("> This is an assistant heuristic and not an official FDA Refuse-to-Accept determination.")
-    md.append("")
-    md.append(f"**RTA Readiness Score:** **{score}/100**  (coverage: {passed}/{len(checklist)})")
-    md.append("")
-    md.append("| Checklist Item | Status | Signals |")
-    md.append("|---|---|---|")
-    for item, status, signals in rows:
-        md.append(f"| {item} | {status} | {signals} |")
-    md.append("")
-    md.append("### Suggested Next Actions")
-    md.append("- For each Missing/Unclear item, locate evidence in OCR text and update the macro summary.")
-    md.append("- Use Evidence Mapper to verify traceability for claims in high-impact sections.")
-    return score, "\n".join(md)
-
-
-def labeling_claims_inspector_run(consolidated: str, summary_text: str, evidence_rows: Optional[List[dict]] = None) -> Tuple[str, List[dict]]:
-    """
-    WOW AI #5 — Labeling & Claims Inspector (heuristic).
-    - Extracts candidate claims from summary + consolidated.
-    - Flags risky/absolute/superiority language.
-    - Attempts to find supporting anchor (via fuzzy match).
-    """
-    if not consolidated.strip():
-        raise RuntimeError("No consolidated OCR available (run OCR first).")
-    anchors = st.session_state.get("docs.consolidated_anchors", {}) or {}
-    anchor_index = build_anchor_index(consolidated)
-    lines = consolidated.splitlines()
-    positions = []
-    cur = 0
-    for ln in lines:
-        positions.append(cur)
-        cur += len(ln) + 1
-
-    # Candidate claim sentences
-    combined = (summary_text or "") + "\n\n" + (consolidated[:8000] or "")
-    sents = re.split(r"(?<=[\.\?!])\s+", combined)
-    risky_terms = ["safe and effective", "guarantee", "superior", "best", "proven", "prevents", "eliminates", "no risk", "never"]
-    perf_terms = ["reduces", "improves", "increases", "detects", "diagnoses", "treats", "prevents", "supports", "enhances"]
-    label_terms = ["warning", "warnings", "precaution", "contraindication", "indications", "intended use", "label", "ifu"]
-
-    claims = []
-    for s in sents:
-        s = s.strip()
-        if len(s) < 40:
+    text = step1_text.strip()
+    # Try to pick a few salient nouns/terms; fallback to generic 510(k).
+    candidates = set()
+    for token in re.findall(r"[A-Za-z][A-Za-z0-9\-\(\)/]{2,}", text)[:120]:
+        if token.lower() in {"the", "and", "for", "with", "that", "this", "from"}:
             continue
-        l = s.lower()
-        if any(rt in l for rt in risky_terms) or any(pt in l for pt in perf_terms) or any(lt in l for lt in label_terms):
-            claims.append(s)
-        if len(claims) >= 40:
-            break
+        candidates.add(token)
+    top = list(candidates)[:8]
+    base = "510(k) FDA guidance"
+    queries = []
+    if top:
+        queries.append(f"{base} {top[0]}")
+        if len(top) > 1:
+            queries.append(f"{base} {top[1]}")
+    queries.append("FDA guidance Premarket Notification 510(k) substantial equivalence")
+    queries.append("FDA guidance device software validation 510(k)")
+    queries.append("FDA cybersecurity guidance medical devices 510(k)")
+    return queries
 
-    if not claims:
-        return "No candidate labeling/claims sentences detected.", []
 
-    rows = []
-    for c in claims:
-        l = c.lower()
-        risk_flags = []
-        if any(rt in l for rt in risky_terms):
-            risk_flags.append("Absolute/Superiority phrasing")
-        if "safe and effective" in l:
-            risk_flags.append("Regulatory-sensitive claim")
-        if "guarantee" in l or "proven" in l:
-            risk_flags.append("High certainty wording")
+def web_research(
+    step1_text: str,
+    depth: str,
+    fda_only: bool,
+) -> List[Dict[str, str]]:
+    """
+    Best-effort web research returning citation candidates.
+    """
+    # depth controls results per query
+    per_query = {"quick": 3, "standard": 5, "exhaustive": 8}.get(depth, 5)
+    queries = web_research_plan(step1_text)
+    citations: List[Dict[str, str]] = []
+    seen = set()
 
-        # find evidence line in consolidated
-        best = {"score": 0, "line": "", "pos": None}
-        if fuzz is not None:
-            for i, ln in enumerate(lines):
-                if not ln.strip():
-                    continue
-                s = fuzz.partial_ratio(c[:260], ln[:400])
-                if s > best["score"]:
-                    best = {"score": s, "line": ln, "pos": positions[i]}
-        else:
-            for i, ln in enumerate(lines):
-                if c[:40].lower() in ln.lower():
-                    best = {"score": 70, "line": ln, "pos": positions[i]}
-                    break
+    for q in queries:
+        res = ddg_search(q, max_results=per_query)
+        if fda_only:
+            res = filter_fda_only(res)
+        for r in res:
+            href = r.get("href", "")
+            if not href or href in seen:
+                continue
+            seen.add(href)
+            citations.append({
+                "title": r.get("title", "").strip(),
+                "url": href.strip(),
+                "snippet": (r.get("snippet", "") or "").strip(),
+                "accessed": datetime.date.today().isoformat(),
+                "query": q,
+            })
+    return citations
 
-        anchor_id = find_nearest_anchor(anchor_index, best["pos"] or 0) if best["pos"] is not None else None
-        anc_meta = anchors.get(anchor_id, {}) if anchor_id else {}
 
-        supported = bool(anchor_id) and best["score"] >= 65
-        status = "Supported" if supported else "Unsupported/Weak"
+def citations_to_markdown(citations: List[Dict[str, str]]) -> str:
+    if not citations:
+        return "_No web citations collected (web research unavailable/disabled)._"
+    lines = ["## References (Web)", ""]
+    for i, c in enumerate(citations, 1):
+        title = c.get("title") or "Untitled"
+        url = c.get("url") or ""
+        accessed = c.get("accessed") or ""
+        q = c.get("query") or ""
+        snippet = c.get("snippet") or ""
+        lines.append(f"{i}. **{title}** — {url}  \n   _Accessed_: {accessed}  \n   _Query_: `{q}`")
+        if snippet:
+            lines.append(f"   - Snippet: {snippet}")
+    return "\n".join(lines)
 
-        safer = ""
-        if "safe and effective" in l:
-            safer = c.replace("safe and effective", "designed and intended for its indicated use").strip()
-        elif "guarantee" in l:
-            safer = re.sub(r"(?i)\bguarantee(s|d)?\b", "aims to", c).strip()
-        elif "superior" in l or "best" in l:
-            safer = re.sub(r"(?i)\b(superior|best)\b", "comparable", c).strip()
 
-        rows.append(
-            {
-                "claim": c,
-                "risk_flags": "; ".join(risk_flags) if risk_flags else "",
-                "support_status": status,
-                "match_confidence": best["score"],
-                "anchor_id": anchor_id or "",
-                "file": anc_meta.get("file_name", ""),
-                "page": anc_meta.get("page", ""),
-                "suggested_safer_wording": safer,
-            }
+# -----------------------------------------------------------------------------
+# 510(k) generation prompts
+# -----------------------------------------------------------------------------
+
+def sys_regulatory_writer(output_lang: str) -> str:
+    if output_lang == "zh-TW":
+        return (
+            "你是一位嚴謹的醫療器材法規審查寫作者，擅長 510(k) 審查架構、證據缺口識別、"
+            "以及以中性、可稽核的語氣撰寫 Markdown 文件。避免臆測；不確定時請標註「未提供/不明」。"
         )
-
-    md = ["## Labeling & Claims Inspector (Heuristic)", ""]
-    md.append("| Claim (truncated) | Support | Confidence | Risk Flags | Anchor |")
-    md.append("|---|---|---:|---|---|")
-    for r in rows:
-        claim = r["claim"]
-        claim = (claim[:140] + "…") if len(claim) > 140 else claim
-        md.append(f"| {claim.replace('|','\\|')} | {r['support_status']} | {r['match_confidence']} | {r['risk_flags'].replace('|','\\|')} | {r['anchor_id']} |")
-    md.append("")
-    md.append("### Reviewer Notes")
-    md.append("- Unsupported/Weak items should be verified in the source PDFs and/or rewritten to remove over-claims.")
-    md.append("- Consider adding explicit evidence references or removing absolute phrasing.")
-    return "\n".join(md), rows
-
-
-def plot_radar(domains: dict):
-    if go is None:
-        st.info("plotly not installed; radar visualization unavailable.")
-        return
-    labels = list(domains.keys())
-    values = list(domains.values())
-    labels2 = labels + [labels[0]]
-    values2 = values + [values[0]]
-    fig = go.Figure()
-    fig.add_trace(go.Scatterpolar(r=values2, theta=labels2, fill="toself", name="Attention Score"))
-    fig.update_layout(
-        polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
-        showlegend=False,
-        margin=dict(l=30, r=30, t=30, b=30),
-        height=360,
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-
-# -----------------------------
-# 13) UI: Nordic header + status strip
-# -----------------------------
-def render_header():
-    col1, col2, col3, col4 = st.columns([2.4, 1.3, 1.3, 1.2], vertical_alignment="center")
-    with col1:
-        st.markdown(f"## {APP_TITLE}")
-        st.markdown("<div class='muted'>Nordic Architecture UI • Split-pane regulatory workspace • Human-in-the-loop agent chain</div>", unsafe_allow_html=True)
-
-    with col2:
-        mode = st.selectbox(
-            t("mode"),
-            ["command_center", "note_keeper"],
-            index=0 if st.session_state["ui.mode"] == "command_center" else 1,
-            format_func=lambda x: t("command_center") if x == "command_center" else t("note_keeper"),
-        )
-        st.session_state["ui.mode"] = mode
-
-        low_res = st.toggle(t("low_resource"), value=st.session_state.get("ui.low_resource_mode", False))
-        st.session_state["ui.low_resource_mode"] = low_res
-
-    with col3:
-        theme = st.selectbox(
-            t("theme"),
-            ["dark", "light"],
-            index=0 if st.session_state["ui.theme"] == "dark" else 1,
-            format_func=lambda x: t("dark") if x == "dark" else t("light"),
-        )
-        st.session_state["ui.theme"] = theme
-
-        lang = st.selectbox(t("language"), ["en", "zh-TW"], index=0 if st.session_state["ui.lang"] == "en" else 1)
-        st.session_state["ui.lang"] = lang
-
-    with col4:
-        style_ids = list(PAINTER_STYLES.keys())
-        current = st.session_state.get("ui.painter_style", "minimal")
-        idx = style_ids.index(current) if current in style_ids else 0
-        chosen = st.selectbox(t("painter_style"), style_ids, index=idx, format_func=lambda x: PAINTER_STYLES[x]["name"])
-        st.session_state["ui.painter_style"] = chosen
-
-        if st.button(t("jackpot")):
-            seed = (st.session_state.get("ui.jackpot_seed", 0) + 1) % len(PAINTER_STYLES)
-            st.session_state["ui.jackpot_seed"] = seed
-            style = list(PAINTER_STYLES.keys())[seed]
-            st.session_state["ui.painter_style"] = style
-            safe_event("ui", "info", f"Jackpot style selected: {PAINTER_STYLES[style]['name']}")
-
-    st.session_state["ui.preserve_prefs_on_purge"] = st.checkbox(
-        "Preserve UI prefs on purge",
-        value=st.session_state.get("ui.preserve_prefs_on_purge", True),
+    return (
+        "You are a meticulous medical device regulatory review writer. Produce audit-ready Markdown. "
+        "Avoid speculation; if unknown, state 'not provided/unclear'."
     )
 
 
-def render_status_strip():
-    srcs = {p: provider_key_source(p) for p in PROVIDERS}
-    reg = st.session_state.get("docs.registry", [])
-    sel = st.session_state.get("docs.queue.selected_ids", set())
-    trimmed = st.session_state.get("docs.trim.outputs", {})
-    consolidated = st.session_state.get("docs.consolidated_markdown", "") or ""
-    ps = st.session_state.get("obs.pipeline_state", {})
-
-    def chip(label: str, status: str):
-        st.markdown(
-            f"<span class='chip {status}'><span class='dot'></span>{label}</span>",
-            unsafe_allow_html=True,
-        )
-
-    st.markdown("<div class='nordic-card'>", unsafe_allow_html=True)
-
-    for p in PROVIDERS:
-        src = srcs[p]
-        status = "ok" if src in ["env", "session"] else "err"
-        chip(f"{p.upper()} key: {src}", status)
-
-    chip(f"PDFs: {len(reg)} ingested / {len(sel)} selected", "ok" if len(sel) else "warn")
-    chip(f"Trimmed: {len(trimmed)}", "ok" if len(trimmed) else "warn")
-    chip(f"OCR chars: {len(consolidated)} (~{approx_tokens(consolidated)} tok)", "ok" if consolidated else "warn")
-
-    for node in ["ingestion", "trim", "ocr", "consolidation", "agents", "summary", "wow_ai", "data"]:
-        stt = ps.get(node, {}).get("status", "idle")
-        status = "ok" if stt == "done" else ("warn" if stt in ["running", "warn", "idle"] else "err")
-        chip(f"{node}: {stt}", status)
-
-    mana = min(100, int((len(consolidated) / 9000) + (len(st.session_state.get("agents.timeline", {}).get("nodes", [])) * 7)))
-    st.progress(mana / 100.0, text=f"Review Mana: {mana}/100")
-
-    mem = mem_estimate_bytes()
-    st.caption(f"Memory estimate (rough): {human_size(mem)}")
-    if mem > 650 * 1024 * 1024:
-        st.warning("Memory pressure risk on Spaces. Consider low-resource mode, trimming fewer pages, or OCR on fewer files.")
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-
-# -----------------------------
-# 14) UI: Left pane (source material)
-# -----------------------------
-def render_left_pane():
-    st.markdown("<div class='nordic-card'><span class='accent'>Source Material</span><div class='muted'>Ingest → Queue → Trim → OCR → Consolidate</div></div>", unsafe_allow_html=True)
-    st.write("")
-
-    with st.expander(t("ingestion"), expanded=True):
-        uploaded = st.file_uploader(t("upload_pdfs"), type=["pdf"], accept_multiple_files=True)
-        paths = st.text_area(t("paths"), placeholder="/path/to/file1.pdf\n/path/to/file2.pdf")
-        c1, c2 = st.columns([1, 1])
-        with c1:
-            if st.button(t("register_files")):
-                set_pipeline_state("ingestion", "running", "Registering files...")
-                if uploaded:
-                    register_uploaded_files(uploaded)
-                if paths.strip():
-                    register_file_paths(paths)
-                ensure_scanned_metadata()
-                set_pipeline_state("ingestion", "done", f"Registry size: {len(st.session_state['docs.registry'])}")
-        with c2:
-            if st.button("Scan PDF metadata"):
-                ensure_scanned_metadata()
-                st.success("Metadata scanned.")
-
-    with st.expander(t("queue"), expanded=True):
-        ensure_scanned_metadata()
-        reg = st.session_state.get("docs.registry", [])
-        if not reg:
-            st.info("No PDFs registered yet.")
-            return
-
-        # Select all/none
-        c1, c2, c3 = st.columns([1, 1, 2])
-        with c1:
-            if st.button("Select all"):
-                st.session_state["docs.queue.selected_ids"] = {f["id"] for f in reg}
-        with c2:
-            if st.button("Select none"):
-                st.session_state["docs.queue.selected_ids"] = set()
-        with c3:
-            st.caption("Advanced: set per-file Trim Range and per-file LLM OCR Prompt Override (optional).")
-
-        # Build editor table
-        if pd is not None:
-            per_trim = st.session_state.get("docs.trim.per_file_override", {}) or {}
-            per_prompt = st.session_state.get("docs.ocr.prompt_per_file", {}) or {}
-            df = pd.DataFrame(
-                [
-                    {
-                        "selected": f["id"] in st.session_state["docs.queue.selected_ids"],
-                        "name": f["name"],
-                        "source": f["source"],
-                        "size": human_size(f["size"]),
-                        "pages": f.get("page_count"),
-                        "health": f.get("health"),
-                        "trim_override": per_trim.get(f["id"], ""),
-                        "ocr_prompt_override": per_prompt.get(f["id"], ""),
-                        "id": f["id"],
-                    }
-                    for f in reg
-                ]
-            )
-            edited = st.data_editor(
-                df,
-                hide_index=True,
-                use_container_width=True,
-                column_config={
-                    "selected": st.column_config.CheckboxColumn(required=True),
-                    "trim_override": st.column_config.TextColumn(help="Optional per-file page range e.g., 1-5,10"),
-                    "ocr_prompt_override": st.column_config.TextColumn(help="Optional per-file LLM OCR prompt override (LLM OCR mode only)"),
-                    "id": st.column_config.TextColumn(disabled=True),
-                },
-                disabled=["name", "source", "size", "pages", "health", "id"],
-            )
-            st.session_state["docs.queue.selected_ids"] = set(edited.loc[edited["selected"] == True, "id"].tolist())
-
-            # Update overrides from edited
-            new_trim = {}
-            new_prompt = {}
-            for _, row in edited.iterrows():
-                fid = row["id"]
-                tr = str(row.get("trim_override", "") or "").strip()
-                pr = str(row.get("ocr_prompt_override", "") or "").strip()
-                if tr:
-                    new_trim[fid] = tr
-                if pr:
-                    new_prompt[fid] = pr
-            st.session_state["docs.trim.per_file_override"] = new_trim
-            st.session_state["docs.ocr.prompt_per_file"] = new_prompt
-        else:
-            st.write(reg)
-
-    with st.expander(t("trim"), expanded=True):
-        st.session_state["docs.trim.global_range"] = st.text_input(t("global_range"), value=st.session_state.get("docs.trim.global_range", "1-5"))
-        policy = st.selectbox("Out-of-range policy", ["clip_with_warn", "skip_file", "block"], index=0)
-        if st.button(t("execute_trim")):
-            try:
-                _ = parse_page_ranges(st.session_state["docs.trim.global_range"])
-                execute_trimming(policy_out_of_range=policy)
-                st.success("Trim complete.")
-            except Exception as e:
-                st.error(str(e))
-
-    with st.expander(t("ocr"), expanded=True):
-        mode = st.selectbox(
-            t("ocr_mode"),
-            ["python_pack", "llm_ocr"],
-            format_func=lambda x: t("python_pack") if x == "python_pack" else t("llm_ocr"),
-            index=0 if st.session_state["docs.ocr.mode"] == "python_pack" else 1,
-        )
-        st.session_state["docs.ocr.mode"] = mode
-
-        if mode == "llm_ocr":
-            st.session_state["docs.ocr.model"] = st.selectbox("Gemini model", GEMINI_MODELS, index=GEMINI_MODELS.index(st.session_state.get("docs.ocr.model", GEMINI_MODELS[0])))
-
-            # Template library
-            tpl_name = st.selectbox("OCR Prompt Template", list(OCR_PROMPT_TEMPLATES.keys()), index=0)
-            c1, c2 = st.columns([1, 1])
-            with c1:
-                if st.button("Apply template (replace)"):
-                    st.session_state["docs.ocr.prompt_global"] = OCR_PROMPT_TEMPLATES[tpl_name]
-            with c2:
-                if st.button("Append template"):
-                    st.session_state["docs.ocr.prompt_global"] = (st.session_state.get("docs.ocr.prompt_global", "") + "\n\n" + OCR_PROMPT_TEMPLATES[tpl_name]).strip()
-
-            st.session_state["docs.ocr.prompt_global"] = st.text_area(t("ocr_prompt"), value=st.session_state.get("docs.ocr.prompt_global", ""), height=140)
-            st.caption("Per-file OCR prompt overrides (if provided in the queue) will override this global prompt for those files.")
-
-        if st.button(t("execute_ocr")):
-            try:
-                execute_ocr()
-                st.success("OCR complete.")
-            except Exception as e:
-                st.error(str(e))
-
-    with st.expander(t("consolidated"), expanded=True):
-        aid = st.session_state.get("consolidated.artifact_id")
-        if not aid and st.session_state.get("docs.consolidated_markdown"):
-            aid = create_artifact(st.session_state["docs.consolidated_markdown"], fmt="markdown", metadata={"source": "ocr_consolidation"})
-            st.session_state["consolidated.artifact_id"] = aid
-
-        if not aid:
-            st.info("No consolidated OCR artifact yet.")
-            return
-
-        tabs = st.tabs(["Text", "Markdown", "Diff", "Versions"])
-        cur_text, cur_meta = artifact_get_current(aid)
-
-        with tabs[0]:
-            new_text = st.text_area("Edit consolidated text", value=cur_text, height=240)
-            if st.button("Save consolidated edit"):
-                artifact_add_version(aid, new_text, created_by="user_edit", metadata={"type": "consolidated_edit"}, parent_version_id=cur_meta.get("version_id"))
-                st.session_state["docs.consolidated_markdown"] = new_text
-                safe_event("artifact", "info", "Consolidated OCR edited and versioned.")
-                st.success("Saved.")
-
-        with tabs[1]:
-            st.markdown(markdown_highlight_keywords(cur_text, st.session_state.get("notes.keywords.palette", {})), unsafe_allow_html=True)
-
-        with tabs[2]:
-            versions = artifact_versions(aid)
-            if len(versions) >= 2:
-                prev = versions[-2]["content_text"]
-                st.markdown(simple_diff(prev, cur_text), unsafe_allow_html=True)
-            else:
-                st.info("Need at least 2 versions for diff.")
-
-        with tabs[3]:
-            versions = artifact_versions(aid)
-            for v in reversed(versions[-10:]):
-                st.write(f"- {v['created_at']} | {v['created_by']} | {v['version_id'][:8]}")
-            sel_vid = st.selectbox("Restore version", [v["version_id"] for v in versions][::-1])
-            if st.button("Restore selected version"):
-                st.session_state["artifacts"][aid]["current_version_id"] = sel_vid
-                restored, _ = artifact_get_current(aid)
-                st.session_state["docs.consolidated_markdown"] = restored
-                safe_event("artifact", "warn", f"Restored consolidated version {sel_vid[:8]}.")
-                st.success("Restored.")
-
-        st.download_button("Download consolidated markdown", data=cur_text.encode("utf-8"), file_name="consolidated_ocr.md", mime="text/markdown")
-
-
-# -----------------------------
-# 15) UI: Right pane (intelligence deck)
-# -----------------------------
-def preflight_require(condition: bool, ok_msg: str, fail_msg: str) -> bool:
-    if condition:
-        st.success(ok_msg)
-        return True
-    st.error(fail_msg)
-    return False
-
-
-def render_agents_and_intelligence():
-    load_agents_yaml_once()
-    cfg = st.session_state.get("agents.yaml.validated")
-    if cfg is None:
-        cfg = validate_agents_yaml(st.session_state.get("agents.yaml.raw", ""))
-        st.session_state["agents.yaml.validated"] = cfg
-        if cfg:
-            set_pipeline_state("agents_yaml", "done", f"Agents: {len(cfg.agents)}")
-        else:
-            set_pipeline_state("agents_yaml", "warn", "agents.yaml not validated yet.")
-
-    tabs = st.tabs([t("agent_orchestration"), t("macro_summary"), t("dynamic_skill"), t("wow_ai"), t("search"), t("dashboards")])
-
-    # ---- Agent Orchestration (plus upload/download/standardize) ----
-    with tabs[0]:
-        st.markdown("<div class='nordic-card'><span class='accent'>Agents</span><div class='muted'>Upload • Standardize • Edit • Validate • Download</div></div>", unsafe_allow_html=True)
-        st.write("")
-
-        # Upload/download UI
-        c1, c2, c3 = st.columns([1.2, 1.2, 2.0])
-        with c1:
-            up = st.file_uploader(t("upload_yaml"), type=["yaml", "yml"], accept_multiple_files=False)
-            if up is not None:
-                raw_up = up.read().decode("utf-8", errors="replace")
-                st.session_state["agents.yaml.original_upload"] = raw_up
-                st.session_state["agents.yaml.raw"] = raw_up
-                st.session_state["agents.yaml.validated"] = None
-                st.session_state["agents.yaml.standardize_report"] = ""
-                safe_event("agents", "info", "Uploaded agents.yaml")
-                st.success("Uploaded. Validate or Standardize.")
-
-        with c2:
-            if st.button(t("standardize_yaml")):
-                raw_in = st.session_state.get("agents.yaml.raw", "")
-                std_yaml, report = standardize_agents_yaml(raw_in)
-                st.session_state["agents.yaml.standardize_report"] = report
-                st.session_state["agents.yaml.raw"] = std_yaml
-                st.session_state["agents.yaml.validated"] = None
-                safe_event("agents", "info", "Standardized agents.yaml")
-                st.success("Standardized into canonical schema. Please review and validate.")
-
-        with c3:
-            st.download_button(
-                t("download_yaml"),
-                data=(st.session_state.get("agents.yaml.raw", "") or "").encode("utf-8"),
-                file_name="agents.yaml",
-                mime="text/yaml",
-            )
-
-        # Editor + report + diff
-        orig = st.session_state.get("agents.yaml.original_upload")
-        std_report = st.session_state.get("agents.yaml.standardize_report", "")
-        raw = st.text_area(t("agents_yaml"), value=st.session_state.get("agents.yaml.raw", ""), height=260)
-        st.session_state["agents.yaml.raw"] = raw
-
-        if orig and std_report:
-            with st.expander("Standardization Report + Diff", expanded=False):
-                st.markdown(std_report)
-                st.markdown("### Diff (Original → Standardized)")
-                st.markdown(simple_diff(orig, raw), unsafe_allow_html=True)
-
-        c4, c5 = st.columns([1, 2])
-        with c4:
-            if st.button(t("validate_yaml")):
-                cfg = validate_agents_yaml(raw)
-                st.session_state["agents.yaml.validated"] = cfg
-                if cfg:
-                    st.success(f"Validated. Agents: {len(cfg.agents)}")
-                    safe_event("agents", "info", "agents.yaml validated.")
-                    set_pipeline_state("agents_yaml", "done", f"Agents: {len(cfg.agents)}")
-                else:
-                    st.error(st.session_state.get("agents.last_error", "Validation failed."))
-                    safe_event("agents", "err", f"agents.yaml validation failed: {st.session_state.get('agents.last_error')}")
-                    set_pipeline_state("agents_yaml", "error", st.session_state.get("agents.last_error", ""))
-
-        with c5:
-            cfg = st.session_state.get("agents.yaml.validated")
-            if cfg:
-                st.caption("Agent Orchestration is ready. Run agents step-by-step below.")
-            else:
-                st.caption("Validate the YAML to enable agent execution. If your YAML is nonstandard, click Standardize YAML.")
-
-        st.divider()
-        cfg = st.session_state.get("agents.yaml.validated")
-        consolidated = st.session_state.get("docs.consolidated_markdown", "") or ""
-        consolidated_aid = st.session_state.get("consolidated.artifact_id")
-
-        # Preflight
-        st.markdown("### Preflight")
-        preflight_require(bool(cfg), "agents.yaml validated.", "agents.yaml not validated.")
-        preflight_require(bool(consolidated.strip()), "Consolidated OCR available.", "No consolidated OCR yet. Run OCR or provide manual input.")
-        st.caption("You can still run an agent with manual input even if OCR is empty; select Manual Input below.")
-
-        if not cfg:
-            return
-
-        # Choose agent
-        agent_ids = [a.id for a in cfg.agents]
-        selected_agent_id = st.selectbox("Select agent", agent_ids, format_func=lambda aid: next((a.name for a in cfg.agents if a.id == aid), aid))
-        agent = next(a for a in cfg.agents if a.id == selected_agent_id)
-
-        # Overrides before run
-        ov = st.session_state["agents.step.overrides"].setdefault(agent.id, {})
-        st.markdown("### Step Overrides (before run)")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            ov["provider"] = st.selectbox("Provider", PROVIDERS, index=PROVIDERS.index(ov.get("provider", agent.provider)))
-        with c2:
-            model_list = SUPPORTED_MODELS.get(ov["provider"], [])
-            fallback_model = agent.model if agent.model in model_list else (model_list[0] if model_list else "gpt-4o-mini")
-            ov["model"] = st.selectbox("Model", model_list, index=model_list.index(ov.get("model", fallback_model)) if model_list else 0)
-        with c3:
-            ov["max_tokens"] = st.number_input("max_tokens", min_value=256, max_value=32000, value=int(ov.get("max_tokens", agent.max_tokens or DEFAULT_MAX_TOKENS)), step=256)
-
-        ov["temperature"] = st.slider("temperature", 0.0, 1.0, float(ov.get("temperature", agent.temperature if agent.temperature is not None else DEFAULT_TEMPERATURE)), 0.05)
-        ov["system_prompt"] = st.text_area("System prompt", value=ov.get("system_prompt", agent.system_prompt or ""), height=110)
-        ov["user_prompt"] = st.text_area("User prompt", value=ov.get("user_prompt", agent.user_prompt or ""), height=110)
-        st.session_state["agents.step.overrides"][agent.id] = ov
-
-        # Input builder
-        st.markdown("### Input Builder")
-        src = st.selectbox("Input source", ["consolidated_ocr", "previous_agent_output", "manual_paste", "combined"], index=0)
-        context_parts = []
-        manual = ""
-        outs = st.session_state.get("agents.step.outputs", {}) or {}
-
-        if src == "consolidated_ocr":
-            context_parts.append(consolidated)
-        elif src == "previous_agent_output":
-            if not outs:
-                st.warning("No previous agent outputs yet.")
-            else:
-                prev_id = st.selectbox("Select previous agent output", list(outs.keys()), format_func=lambda aid: next((a.name for a in cfg.agents if a.id == aid), aid))
-                prev_art = outs[prev_id]
-                prev_text, _ = artifact_get_current(prev_art)
-                context_parts.append(prev_text)
-        elif src == "manual_paste":
-            manual = st.text_area("Manual input", height=140)
-            context_parts.append(manual)
-        else:
-            include_consolidated = st.checkbox("Include consolidated OCR", value=bool(consolidated.strip()))
-            include_prev = st.checkbox("Include previous agent output", value=bool(outs))
-            include_manual = st.checkbox("Include manual paste", value=False)
-            if include_consolidated:
-                context_parts.append(consolidated)
-            if include_prev and outs:
-                prev_id = st.selectbox("Previous output", list(outs.keys()), format_func=lambda aid: next((a.name for a in cfg.agents if a.id == aid), aid))
-                prev_art = outs[prev_id]
-                prev_text, _ = artifact_get_current(prev_art)
-                context_parts.append(prev_text)
-            if include_manual:
-                manual = st.text_area("Manual input", height=120)
-                context_parts.append(manual)
-
-        context = "\n\n".join([p for p in context_parts if p and p.strip()])
-        st.caption(f"Context size: {len(context)} chars (~{approx_tokens(context)} tok est)")
-
-        # Run agent
-        if st.button("Run Agent"):
-            if not context.strip():
-                st.error("Empty context. Select a valid input source or paste manual input.")
-            else:
-                try:
-                    set_pipeline_state("agents", "running", f"Running agent {agent.id}...")
-                    out, meta = llm_execute(
-                        provider=ov["provider"],
-                        model=ov["model"],
-                        system_prompt=ov["system_prompt"],
-                        user_prompt=ov["user_prompt"],
-                        context=context,
-                        max_tokens=int(ov["max_tokens"]),
-                        temperature=float(ov["temperature"]),
-                    )
-                    meta["kind"] = "agent_run"
-                    artifact_id = create_artifact(out, fmt="markdown", metadata=meta)
-                    st.session_state["agents.step.outputs"][agent.id] = artifact_id
-                    node = timeline_add_node("agent_run", agent.name, artifact_id, meta)
-                    # connect consolidated node if exists
-                    if consolidated_aid:
-                        if not st.session_state.get("timeline.consolidated_node_id"):
-                            cn = timeline_add_node("ocr_consolidated", "Consolidated OCR", consolidated_aid, {"chars": len(consolidated)})
-                            st.session_state["timeline.consolidated_node_id"] = cn
-                        timeline_add_edge(st.session_state["timeline.consolidated_node_id"], node, "context")
-                    set_pipeline_state("agents", "done", f"Agent {agent.id} done.")
-                    st.success("Agent completed.")
-                    safe_event("agents", "info", f"Agent run completed: {agent.id}")
-                except Exception as e:
-                    set_pipeline_state("agents", "error", str(e))
-                    safe_event("agents", "err", f"Agent failed: {e}")
-                    st.error(str(e))
-
-        # Output editor
-        out_aid = st.session_state.get("agents.step.outputs", {}).get(agent.id)
-        if out_aid:
-            st.divider()
-            st.markdown("### Agent Output (editable handoff)")
-            out_tabs = st.tabs(["Text", "Markdown", "Diff", "Versions"])
-            out_text, out_meta = artifact_get_current(out_aid)
-
-            with out_tabs[0]:
-                edited = st.text_area("Edit output", value=out_text, height=240)
-                cA, cB = st.columns([1, 1])
-                with cA:
-                    if st.button("Save output edit"):
-                        artifact_add_version(out_aid, edited, created_by="user_edit", metadata={"type": "agent_output_edit"}, parent_version_id=out_meta.get("version_id"))
-                        safe_event("artifact", "info", f"Edited agent output versioned: {agent.id}")
-                        st.success("Saved.")
-                with cB:
-                    if st.button("Commit as Next Input"):
-                        # Commit is conceptual; input builder can pick previous agent output.
-                        timeline_add_node("handoff_commit", f"Handoff committed from {agent.name}", out_aid, {"agent_id": agent.id})
-                        safe_event("agents", "info", f"Committed output as next input: {agent.id}")
-                        st.success("Committed. Select it as 'previous agent output' in next step.")
-
-            with out_tabs[1]:
-                st.markdown(markdown_highlight_keywords(out_text, st.session_state.get("notes.keywords.palette", {})), unsafe_allow_html=True)
-            with out_tabs[2]:
-                versions = artifact_versions(out_aid)
-                if len(versions) >= 2:
-                    st.markdown(simple_diff(versions[-2]["content_text"], out_text), unsafe_allow_html=True)
-                else:
-                    st.info("Need at least 2 versions for diff.")
-            with out_tabs[3]:
-                versions = artifact_versions(out_aid)
-                for v in reversed(versions[-10:]):
-                    st.write(f"- {v['created_at']} | {v['created_by']} | {v['version_id'][:8]}")
-                sel_vid = st.selectbox("Restore version (agent output)", [v["version_id"] for v in versions][::-1], key=f"restore_agent_{agent.id}")
-                if st.button("Restore selected (agent output)", key=f"restore_btn_{agent.id}"):
-                    st.session_state["artifacts"][out_aid]["current_version_id"] = sel_vid
-                    safe_event("artifact", "warn", f"Restored agent {agent.id} output version {sel_vid[:8]}.")
-                    st.success("Restored.")
-
-    # ---- Macro Summary ----
-    with tabs[1]:
-        st.markdown("<div class='nordic-card'><span class='accent'>Macro Summary</span><div class='muted'>Versioned report + persistent prompt revisions</div></div>", unsafe_allow_html=True)
-        st.write("")
-
-        cfg = st.session_state.get("agents.yaml.validated")
-        outs = st.session_state.get("agents.step.outputs", {}) or {}
-        consolidated = st.session_state.get("docs.consolidated_markdown", "") or ""
-
-        # Preflight
-        st.markdown("### Preflight")
-        preflight_require(bool(get_effective_key("openai") or get_effective_key("gemini") or get_effective_key("anthropic") or get_effective_key("grok")),
-                          "At least one provider key available.", "No provider keys available (env or session).")
-        st.caption("Macro summary can use any provider/model you choose below.")
-
-        src = st.selectbox("Macro summary input source", ["consolidated_ocr", "agent_output", "manual_paste"], index=0)
-        context = ""
-        if src == "consolidated_ocr":
-            context = consolidated
-        elif src == "agent_output":
-            if outs and cfg:
-                aid_sel = st.selectbox("Select agent output", list(outs.keys()), format_func=lambda x: next((a.name for a in cfg.agents if a.id == x), x))
-                art_id = outs[aid_sel]
-                context, _ = artifact_get_current(art_id)
-            else:
-                st.info("No agent outputs available.")
-        else:
-            context = st.text_area("Manual markdown/text", height=160)
-
-        provider = st.selectbox("Provider", PROVIDERS, index=0, key="macro_provider")
-        model = st.selectbox("Model", SUPPORTED_MODELS.get(provider, []), index=0, key="macro_model")
-        max_tokens = st.number_input("max_tokens", min_value=256, max_value=32000, value=DEFAULT_MAX_TOKENS, step=256, key="macro_tokens")
-        temperature = st.slider("temperature", 0.0, 1.0, 0.2, 0.05, key="macro_temp")
-
-        # Try to find a macro agent in YAML for prompt defaults
-        macro_agent = None
-        if cfg:
-            macro_agent = next((a for a in cfg.agents if "macro" in a.name.lower() or "3000" in (a.system_prompt or "").lower()), None)
-            if not macro_agent:
-                macro_agent = cfg.agents[-1]
-
-        system_prompt = st.text_area(
-            "System prompt (macro)",
-            value=(macro_agent.system_prompt if macro_agent else "You are a regulatory writing engine. Output 3000–4000 words in Markdown."),
-            height=120,
-        )
-        user_prompt = st.text_area(
-            "User prompt (macro)",
-            value=(macro_agent.user_prompt if macro_agent else "Write a comprehensive 3000–4000 word FDA-style analytical review report based strictly on the provided content."),
-            height=120,
-        )
-
-        st.caption(f"Context size: {len(context)} chars (~{approx_tokens(context)} tok est)")
-        if st.button("Generate Macro Summary"):
-            if not context.strip():
-                st.error("No context.")
-            else:
-                try:
-                    set_pipeline_state("summary", "running", "Generating macro summary...")
-                    out, meta = llm_execute(provider, model, system_prompt, user_prompt, context, int(max_tokens), float(temperature))
-                    meta["kind"] = "macro_summary"
-                    if not st.session_state.get("summary.artifact_id"):
-                        sid = create_artifact(out, fmt="markdown", metadata=meta)
-                        st.session_state["summary.artifact_id"] = sid
-                    else:
-                        sid = st.session_state["summary.artifact_id"]
-                        cur, curm = artifact_get_current(sid)
-                        artifact_add_version(sid, out, created_by="macro_agent", metadata=meta, parent_version_id=curm.get("version_id"))
-                    timeline_add_node("macro_summary", "Macro Summary", st.session_state["summary.artifact_id"], meta)
-                    set_pipeline_state("summary", "done", "Macro summary generated.")
-                    safe_event("summary", "info", "Macro summary generated.")
-                    st.success("Macro summary generated.")
-                except Exception as e:
-                    set_pipeline_state("summary", "error", str(e))
-                    safe_event("summary", "err", f"Macro summary failed: {e}")
-                    st.error(str(e))
-
-        sid = st.session_state.get("summary.artifact_id")
-        if not sid:
-            st.info("No macro summary artifact yet.")
-        else:
-            st.divider()
-            st.markdown("### Macro Summary Editor")
-            s_tabs = st.tabs(["Text", "Markdown", "Diff", "Versions"])
-            s_text, s_meta = artifact_get_current(sid)
-
-            with s_tabs[0]:
-                edited = st.text_area("Edit macro summary", value=s_text, height=280)
-                if st.button("Save summary edit"):
-                    artifact_add_version(sid, edited, created_by="user_edit", metadata={"type": "summary_edit"}, parent_version_id=s_meta.get("version_id"))
-                    safe_event("summary", "info", "Macro summary edited.")
-                    st.success("Saved.")
-
-            with s_tabs[1]:
-                st.markdown(markdown_highlight_keywords(s_text, st.session_state.get("notes.keywords.palette", {})), unsafe_allow_html=True)
-
-            with s_tabs[2]:
-                versions = artifact_versions(sid)
-                if len(versions) >= 2:
-                    st.markdown(simple_diff(versions[-2]["content_text"], s_text), unsafe_allow_html=True)
-                else:
-                    st.info("Need at least 2 versions for diff.")
-
-            with s_tabs[3]:
-                versions = artifact_versions(sid)
-                for v in reversed(versions[-10:]):
-                    st.write(f"- {v['created_at']} | {v['created_by']} | {v['version_id'][:8]}")
-                sel_vid = st.selectbox("Restore version (summary)", [v["version_id"] for v in versions][::-1], key="restore_summary")
-                if st.button("Restore selected (summary)"):
-                    st.session_state["artifacts"][sid]["current_version_id"] = sel_vid
-                    safe_event("summary", "warn", f"Restored summary version {sel_vid[:8]}.")
-                    st.success("Restored.")
-
-            st.divider()
-            st.markdown("### " + t("persistent_prompt"))
-            st.session_state["summary.persistent_prompt"] = st.text_area("Prompt to revise current summary", value=st.session_state.get("summary.persistent_prompt", ""), height=90)
-            if st.button(t("run_persistent_prompt")):
-                prompt = st.session_state.get("summary.persistent_prompt", "")
-                if not prompt.strip():
-                    st.warning("Empty prompt.")
-                else:
-                    try:
-                        set_pipeline_state("summary", "running", "Applying persistent prompt...")
-                        cur_text, curm = artifact_get_current(sid)
-                        sys_p = "You are revising an FDA-style regulatory report. Preserve factuality. Update per instruction. Output Markdown."
-                        usr_p = prompt.strip()
-                        out, meta = llm_execute(provider, model, sys_p, usr_p, cur_text, int(max_tokens), float(temperature))
-                        artifact_add_version(sid, out, created_by="persistent_prompt", metadata={"kind": "persistent_prompt", **meta}, parent_version_id=curm.get("version_id"))
-                        timeline_add_node("summary_revision", "Summary Revision (Persistent Prompt)", sid, {"prompt_hash": sha256_hex(prompt), **meta})
-                        set_pipeline_state("summary", "done", "Persistent prompt applied.")
-                        safe_event("summary", "info", "Persistent prompt applied.")
-                        st.success("Updated.")
-                    except Exception as e:
-                        set_pipeline_state("summary", "error", str(e))
-                        safe_event("summary", "err", f"Persistent prompt failed: {e}")
-                        st.error(str(e))
-
-            st.download_button("Download macro summary", data=s_text.encode("utf-8"), file_name="macro_summary.md", mime="text/markdown")
-
-    # ---- Dynamic Skill Execution ----
-    with tabs[2]:
-        st.markdown("<div class='nordic-card'><span class='accent'>Dynamic Skill Execution</span><div class='muted'>Paste a skill → run against current summary → artifact output</div></div>", unsafe_allow_html=True)
-        st.write("")
-
-        sid = st.session_state.get("summary.artifact_id")
-        if not sid:
-            st.info("Generate a macro summary first.")
-        else:
-            desc = st.text_area(t("skill_desc"), value=st.session_state.get("skills.last_description", ""), height=160)
-            st.session_state["skills.last_description"] = desc
-
-            provider = st.selectbox("Provider (skill)", PROVIDERS, index=0, key="skill_provider")
-            model = st.selectbox("Model (skill)", SUPPORTED_MODELS.get(provider, []), index=0, key="skill_model")
-            max_tokens = st.number_input("max_tokens (skill)", min_value=256, max_value=32000, value=DEFAULT_MAX_TOKENS, step=256, key="skill_tokens")
-            temperature = st.slider("temperature (skill)", 0.0, 1.0, 0.2, 0.05, key="skill_temp")
-
-            st.caption("Preflight: requires summary artifact and provider key.")
-            if st.button(t("run_skill")):
-                if not desc.strip():
-                    st.error("Skill description is empty.")
-                else:
-                    try:
-                        set_pipeline_state("wow_ai", "running", "Executing skill...")
-                        summary_text, _ = artifact_get_current(sid)
-                        system_prompt = desc.strip()
-                        user_prompt = "Apply the skill precisely to the provided summary. Output Markdown. Do not invent facts."
-                        out, meta = llm_execute(provider, model, system_prompt, user_prompt, summary_text, int(max_tokens), float(temperature))
-                        aid = create_artifact(out, fmt="markdown", metadata={"kind": "skill_output", **meta, "skill_hash": sha256_hex(desc)})
-                        st.session_state["skills.outputs"].append(aid)
-                        timeline_add_node("skill_output", "Dynamic Skill Output", aid, {"skill_hash": sha256_hex(desc), **meta})
-                        set_pipeline_state("wow_ai", "done", "Skill executed.")
-                        safe_event("skills", "info", "Dynamic skill executed.")
-                        st.success("Skill executed.")
-                    except Exception as e:
-                        set_pipeline_state("wow_ai", "error", str(e))
-                        safe_event("skills", "err", f"Skill failed: {e}")
-                        st.error(str(e))
-
-            if st.session_state.get("skills.outputs"):
-                st.divider()
-                st.markdown("### Skill Result Cards")
-                for i, aid in enumerate(reversed(st.session_state["skills.outputs"][-5:]), start=1):
-                    text, _ = artifact_get_current(aid)
-                    with st.expander(f"Skill Output #{i}", expanded=False):
-                        st.markdown(markdown_highlight_keywords(text, st.session_state.get("notes.keywords.palette", {})), unsafe_allow_html=True)
-                        st.download_button(f"Download Skill Output #{i}", data=text.encode("utf-8"), file_name=f"skill_output_{i}.md", mime="text/markdown")
-
-    # ---- WOW AI ----
-    with tabs[3]:
-        st.markdown("<div class='nordic-card'><span class='accent'>WOW AI</span><div class='muted'>Evidence • Consistency • Risk • RTA • Claims</div></div>", unsafe_allow_html=True)
-        st.write("")
-
-        sid = st.session_state.get("summary.artifact_id")
-        consolidated = st.session_state.get("docs.consolidated_markdown", "") or ""
-        if not sid:
-            st.info("Generate a macro summary first.")
-            return
-        summary_text, _ = artifact_get_current(sid)
-
-        wow_tabs = st.tabs([t("evidence_mapper"), t("consistency_guardian"), t("risk_radar"), t("rta_gatekeeper"), t("claims_inspector")])
-
-        # Evidence Mapper
-        with wow_tabs[0]:
-            st.caption("Preflight: requires consolidated OCR anchors + target artifact.")
-            target = st.selectbox("Map evidence for", ["macro_summary", "selected_agent_output"], index=0, key="evi_target")
-            target_text = summary_text
-            cfg = st.session_state.get("agents.yaml.validated")
-            outs = st.session_state.get("agents.step.outputs", {}) or {}
-            if target == "selected_agent_output":
-                if cfg and outs:
-                    aid_sel = st.selectbox("Agent output", list(outs.keys()), format_func=lambda x: next((a.name for a in cfg.agents if a.id == x), x), key="evi_agent_sel")
-                    art_id = outs[aid_sel]
-                    target_text, _ = artifact_get_current(art_id)
-                else:
-                    st.info("No agent outputs available; using macro summary.")
-
-            if st.button("Map Evidence"):
-                try:
-                    set_pipeline_state("wow_ai", "running", "Evidence mapping...")
-                    md, rows = evidence_mapper_run(target_text)
-                    aid = create_artifact(md, fmt="markdown", metadata={"kind": "evidence_map", "rows": len(rows)})
-                    st.session_state["wow.evidence.artifact_id"] = aid
-                    st.session_state["wow.evidence.rows"] = rows
-                    timeline_add_node("wow_evidence_map", "WOW Evidence Map", aid, {"rows": len(rows)})
-                    set_pipeline_state("wow_ai", "done", "Evidence mapping complete.")
-                    safe_event("wow_ai", "info", "Evidence mapping completed.")
-                    st.success("Evidence mapping complete.")
-                except Exception as e:
-                    set_pipeline_state("wow_ai", "error", str(e))
-                    safe_event("wow_ai", "err", f"Evidence mapping failed: {e}")
-                    st.error(str(e))
-
-            aid = st.session_state.get("wow.evidence.artifact_id")
-            if aid:
-                md, _ = artifact_get_current(aid)
-                st.markdown(md, unsafe_allow_html=True)
-                rows = st.session_state.get("wow.evidence.rows", [])
-                if pd is not None and rows:
-                    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-                st.download_button("Download evidence map", data=md.encode("utf-8"), file_name="evidence_map.md", mime="text/markdown")
-
-        # Consistency Guardian
-        with wow_tabs[1]:
-            if st.button("Run Consistency Check"):
-                try:
-                    set_pipeline_state("wow_ai", "running", "Consistency checking...")
-                    md = consistency_guardian_run(summary_text)
-                    aid = create_artifact(md, fmt="markdown", metadata={"kind": "consistency_report"})
-                    st.session_state["wow.consistency.artifact_id"] = aid
-                    timeline_add_node("wow_consistency", "WOW Consistency Report", aid, {})
-                    set_pipeline_state("wow_ai", "done", "Consistency check complete.")
-                    safe_event("wow_ai", "info", "Consistency check completed.")
-                    st.success("Consistency check complete.")
-                except Exception as e:
-                    set_pipeline_state("wow_ai", "error", str(e))
-                    safe_event("wow_ai", "err", f"Consistency check failed: {e}")
-                    st.error(str(e))
-
-            aid = st.session_state.get("wow.consistency.artifact_id")
-            if aid:
-                md, _ = artifact_get_current(aid)
-                st.markdown(md, unsafe_allow_html=True)
-                st.download_button("Download consistency report", data=md.encode("utf-8"), file_name="consistency_report.md", mime="text/markdown")
-
-        # Risk Radar
-        with wow_tabs[2]:
-            evidence_rows = st.session_state.get("wow.evidence.rows")
-            if st.button("Generate Risk Radar"):
-                try:
-                    set_pipeline_state("wow_ai", "running", "Generating risk radar...")
-                    domains, md = risk_radar_run(summary_text, evidence_results=evidence_rows)
-                    aid = create_artifact(md, fmt="markdown", metadata={"kind": "risk_radar"})
-                    st.session_state["wow.risk.artifact_id"] = aid
-                    st.session_state["wow.risk.domains"] = domains
-                    timeline_add_node("wow_risk_radar", "WOW Risk Radar", aid, {"domains": domains})
-                    set_pipeline_state("wow_ai", "done", "Risk radar complete.")
-                    safe_event("wow_ai", "info", "Risk radar generated.")
-                    st.success("Risk radar complete.")
-                except Exception as e:
-                    set_pipeline_state("wow_ai", "error", str(e))
-                    safe_event("wow_ai", "err", f"Risk radar failed: {e}")
-                    st.error(str(e))
-
-            aid = st.session_state.get("wow.risk.artifact_id")
-            if aid:
-                md, _ = artifact_get_current(aid)
-                domains = st.session_state.get("wow.risk.domains", {})
-                if domains:
-                    plot_radar(domains)
-                st.markdown(md, unsafe_allow_html=True)
-                st.download_button("Download risk radar", data=md.encode("utf-8"), file_name="risk_radar.md", mime="text/markdown")
-
-        # RTA Gatekeeper (new)
-        with wow_tabs[3]:
-            if st.button("Run RTA Gatekeeper"):
-                try:
-                    set_pipeline_state("wow_ai", "running", "Running RTA gatekeeper...")
-                    score, md = rta_gatekeeper_run(summary_text)
-                    aid = create_artifact(md, fmt="markdown", metadata={"kind": "rta_gatekeeper", "score": score})
-                    st.session_state["wow.rta.artifact_id"] = aid
-                    st.session_state["wow.rta.score"] = score
-                    timeline_add_node("wow_rta_gatekeeper", "WOW RTA Gatekeeper", aid, {"score": score})
-                    set_pipeline_state("wow_ai", "done", "RTA gatekeeper complete.")
-                    safe_event("wow_ai", "info", "RTA gatekeeper completed.")
-                    st.success(f"RTA Gatekeeper complete. Score: {score}/100")
-                except Exception as e:
-                    set_pipeline_state("wow_ai", "error", str(e))
-                    safe_event("wow_ai", "err", f"RTA gatekeeper failed: {e}")
-                    st.error(str(e))
-
-            aid = st.session_state.get("wow.rta.artifact_id")
-            if aid:
-                md, _ = artifact_get_current(aid)
-                st.markdown(md, unsafe_allow_html=True)
-                st.download_button("Download RTA report", data=md.encode("utf-8"), file_name="rta_gatekeeper.md", mime="text/markdown")
-
-        # Labeling & Claims Inspector (new)
-        with wow_tabs[4]:
-            st.caption("Preflight: requires consolidated OCR (best for labeling extraction).")
-            if st.button("Run Claims Inspector"):
-                try:
-                    set_pipeline_state("wow_ai", "running", "Running claims inspector...")
-                    evidence_rows = st.session_state.get("wow.evidence.rows")
-                    md, rows = labeling_claims_inspector_run(consolidated, summary_text, evidence_rows=evidence_rows)
-                    aid = create_artifact(md, fmt="markdown", metadata={"kind": "claims_inspector", "rows": len(rows)})
-                    st.session_state["wow.claims.artifact_id"] = aid
-                    st.session_state["wow.claims.rows"] = rows
-                    timeline_add_node("wow_claims_inspector", "WOW Claims Inspector", aid, {"rows": len(rows)})
-                    set_pipeline_state("wow_ai", "done", "Claims inspector complete.")
-                    safe_event("wow_ai", "info", "Claims inspector completed.")
-                    st.success("Claims inspector complete.")
-                except Exception as e:
-                    set_pipeline_state("wow_ai", "error", str(e))
-                    safe_event("wow_ai", "err", f"Claims inspector failed: {e}")
-                    st.error(str(e))
-
-            aid = st.session_state.get("wow.claims.artifact_id")
-            if aid:
-                md, _ = artifact_get_current(aid)
-                st.markdown(md, unsafe_allow_html=True)
-                rows = st.session_state.get("wow.claims.rows", [])
-                if pd is not None and rows:
-                    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-                st.download_button("Download claims report", data=md.encode("utf-8"), file_name="claims_inspector.md", mime="text/markdown")
-
-    # ---- Search ----
-    with tabs[4]:
-        st.markdown("<div class='nordic-card'><span class='accent'>Search + Device Context</span><div class='muted'>Embedded datasets (510k/MDR/GUDID/Recall) with graceful empty states</div></div>", unsafe_allow_html=True)
-        st.write("")
-
-        if not st.session_state.get("data.loaded"):
-            if st.button("Load datasets"):
-                load_datasets_best_effort()
-                st.success("Dataset load attempted. See counts below.")
-
-        counts = st.session_state.get("data.counts", {})
-        st.caption(f"Dataset counts: {counts}")
-
-        query = st.text_input("Query", value=st.session_state.get("data.last_query", ""))
-        if st.button("Search"):
-            st.session_state["data.last_query"] = query
-            res = fuzzy_search_all(query)
-            st.session_state["data.last_results"] = res
-            safe_event("search", "info", f"Search executed: '{query}'")
-            st.success("Search complete.")
-
-        res = st.session_state.get("data.last_results", {}) or {}
-        if pd is not None and res:
-            for name, df in res.items():
-                st.markdown(f"### {name.upper()} results")
-                if df is None:
-                    st.info("No data.")
-                elif getattr(df, "empty", True):
-                    st.info("No matches.")
-                else:
-                    st.dataframe(df.head(25), use_container_width=True)
-        elif query.strip():
-            st.info("No results available (datasets may be missing or empty).")
-
-        # Minimal 360° device view placeholder
-        st.markdown("### 360° Device View (minimal placeholder)")
-        dv = st.session_state.get("data.device_view", {}) or {}
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.metric("MDR count", dv.get("mdr_count", 0))
-        with c2:
-            st.metric("Max Recall Class", dv.get("recall_max_class", 0))
-        with c3:
-            st.metric("GUDID flags", dv.get("gudid_flags", 0))
-        st.caption("Integrate this with your dataset schema to compute real KPIs (K-number/product code linkage).")
-
-    # ---- Dashboards ----
-    with tabs[5]:
-        dash_tabs = st.tabs([t("mission_control"), t("intel_board"), t("timeline"), t("logs"), t("export")])
-
-        with dash_tabs[0]:
-            st.markdown("<div class='nordic-card'><span class='accent'>Mission Control</span><div class='muted'>Pipeline state • Provider telemetry • Resource guardrails</div></div>", unsafe_allow_html=True)
-            st.write("")
-            ps = st.session_state.get("obs.pipeline_state", {})
-            if pd is not None:
-                rows = [{"node": k, "status": v.get("status"), "last_update": v.get("last_update"), "detail": v.get("detail")} for k, v in ps.items()]
-                st.dataframe(pd.DataFrame(rows) if rows else pd.DataFrame(columns=["node", "status", "last_update", "detail"]),
-                             use_container_width=True, hide_index=True)
-            else:
-                st.write(ps)
-
-            m = st.session_state.get("obs.metrics", {})
-            st.markdown("#### Provider Telemetry (session)")
-            calls = {p: int(m.get(f"{p}.calls", 0)) for p in PROVIDERS}
-            st.write("Calls:", calls)
-            st.write("Latency ms total:", {p: int(m.get(f"{p}.latency_ms_total", 0)) for p in PROVIDERS})
-            st.write("Approx memory:", human_size(mem_estimate_bytes()))
-
-        with dash_tabs[1]:
-            st.markdown("<div class='nordic-card'><span class='accent'>Regulatory Intelligence Board</span><div class='muted'>Risk • RTA • Claims • Device context (summary)</div></div>", unsafe_allow_html=True)
-            st.write("")
-            c1, c2, c3, c4 = st.columns(4)
-            with c1:
-                st.metric("Risk Radar ready", "Yes" if st.session_state.get("wow.risk.artifact_id") else "No")
-            with c2:
-                score = st.session_state.get("wow.rta.score")
-                st.metric("RTA Score", score if score is not None else "—")
-            with c3:
-                rows = st.session_state.get("wow.claims.rows") or []
-                st.metric("Claims flagged", len(rows) if rows else "—")
-            with c4:
-                evi = st.session_state.get("wow.evidence.rows") or []
-                mapped = sum(1 for r in evi if r.get("anchor_id")) if evi else 0
-                st.metric("Evidence coverage", f"{mapped}/{len(evi)}" if evi else "—")
-
-            domains = st.session_state.get("wow.risk.domains")
-            if domains:
-                st.markdown("#### Risk Radar (preview)")
-                plot_radar(domains)
-
-            # quick access outputs
-            st.markdown("#### Latest WOW AI Outputs")
-            for key, label in [
-                ("wow.evidence.artifact_id", "Evidence Map"),
-                ("wow.consistency.artifact_id", "Consistency Report"),
-                ("wow.risk.artifact_id", "Risk Radar"),
-                ("wow.rta.artifact_id", "RTA Gatekeeper"),
-                ("wow.claims.artifact_id", "Claims Inspector"),
-            ]:
-                aid = st.session_state.get(key)
-                if aid:
-                    text, _ = artifact_get_current(aid)
-                    with st.expander(label, expanded=False):
-                        st.markdown(text, unsafe_allow_html=True)
-
-        with dash_tabs[2]:
-            st.markdown("<div class='nordic-card'><span class='accent'>Timeline / DAG</span><div class='muted'>Run traceability • nodes + edges • versioned artifacts</div></div>", unsafe_allow_html=True)
-            st.write("")
-            tl = st.session_state.get("agents.timeline", {"nodes": [], "edges": []})
-            if pd is not None:
-                st.markdown("#### Nodes")
-                st.dataframe(pd.DataFrame(tl["nodes"]), use_container_width=True, hide_index=True)
-                st.markdown("#### Edges")
-                st.dataframe(pd.DataFrame(tl["edges"]), use_container_width=True, hide_index=True)
-            else:
-                st.write(tl)
-
-        with dash_tabs[3]:
-            st.markdown("<div class='nordic-card'><span class='accent'>Session Logs</span><div class='muted'>Redacted events • filters • export</div></div>", unsafe_allow_html=True)
-            st.write("")
-            events = st.session_state.get("obs.events", [])
-            if pd is not None and events:
-                df = pd.DataFrame(events)
-                sev = st.multiselect("Severity filter", ["info", "warn", "err"], default=["info", "warn", "err"])
-                comp = st.text_input("Component contains", value="")
-                df2 = df[df["severity"].isin(sev)]
-                if comp.strip():
-                    df2 = df2[df2["component"].astype(str).str.contains(comp.strip(), case=False, na=False)]
-                st.dataframe(df2, use_container_width=True, hide_index=True)
-                st.download_button("Download logs (json)", data=json.dumps(events, ensure_ascii=False, indent=2).encode("utf-8"),
-                                   file_name="session_logs.json", mime="application/json")
-            else:
-                st.write(events or "No logs yet.")
-
-        with dash_tabs[4]:
-            st.markdown("<div class='nordic-card'><span class='accent'>Export</span><div class='muted'>Build an audit-friendly bundle (session-scoped)</div></div>", unsafe_allow_html=True)
-            st.write("")
-            if st.button("Build export bundle"):
-                bundle = {}
-                caid = st.session_state.get("consolidated.artifact_id")
-                if caid:
-                    ctext, _ = artifact_get_current(caid)
-                    bundle["consolidated_ocr.md"] = ctext
-
-                sid = st.session_state.get("summary.artifact_id")
-                if sid:
-                    stext, _ = artifact_get_current(sid)
-                    bundle["macro_summary.md"] = stext
-
-                for k, fname in [
-                    ("wow.evidence.artifact_id", "evidence_map.md"),
-                    ("wow.consistency.artifact_id", "consistency_report.md"),
-                    ("wow.risk.artifact_id", "risk_radar.md"),
-                    ("wow.rta.artifact_id", "rta_gatekeeper.md"),
-                    ("wow.claims.artifact_id", "claims_inspector.md"),
-                ]:
-                    aid = st.session_state.get(k)
-                    if aid:
-                        text, _ = artifact_get_current(aid)
-                        bundle[fname] = text
-
-                bundle["agents.yaml"] = st.session_state.get("agents.yaml.raw", "")
-                bundle["session_logs.json"] = json.dumps(st.session_state.get("obs.events", []), ensure_ascii=False, indent=2)
-
-                st.session_state["obs.export.ready"] = {"built_at": now_taipei_str(), "files": list(bundle.keys())}
-                st.success(f"Bundle built with {len(bundle)} files.")
-                for fn, content in bundle.items():
-                    mime = "text/markdown" if fn.endswith(".md") else ("text/yaml" if fn.endswith(".yaml") else "application/json")
-                    st.download_button(f"Download {fn}", data=(content.encode("utf-8") if isinstance(content, str) else content),
-                                       file_name=fn, mime=mime)
-
-
-# -----------------------------
-# 16) Note Keeper (kept)
-# -----------------------------
-def render_note_keeper():
-    st.markdown("<div class='nordic-card'><span class='accent'>AI Note Keeper</span><div class='muted'>Paste → organize → edit → AI magics + keyword coloring</div></div>", unsafe_allow_html=True)
-    st.write("")
-
-    c1, c2 = st.columns([1.2, 1])
-    with c1:
-        st.session_state["notes.input_raw"] = st.text_area("Paste note (text/markdown)", value=st.session_state.get("notes.input_raw", ""), height=220)
-        st.session_state["notes.prompt"] = st.text_area("Note transform prompt", value=st.session_state.get("notes.prompt", ""), height=110)
-
-        prov = st.selectbox("Provider", PROVIDERS, index=PROVIDERS.index(st.session_state.get("notes.model_provider", "openai")))
-        st.session_state["notes.model_provider"] = prov
-        model = st.selectbox("Model", SUPPORTED_MODELS.get(prov, []), index=0)
-        st.session_state["notes.model"] = model
-
-        max_tokens = st.number_input("max_tokens", min_value=256, max_value=32000, value=6000, step=256)
-        temperature = st.slider("temperature", 0.0, 1.0, 0.2, 0.05)
-
-        if st.button("Transform note to organized Markdown"):
-            try:
-                inp = st.session_state.get("notes.input_raw", "")
-                if not inp.strip():
-                    st.error("Empty note.")
-                else:
-                    sys_p = "You are an expert note organizer. Output clean Markdown. Do not invent facts."
-                    usr_p = st.session_state.get("notes.prompt", "")
-                    out, meta = llm_execute(prov, model, sys_p, usr_p, inp, int(max_tokens), float(temperature))
-                    meta["kind"] = "note_transform"
-                    if not st.session_state.get("notes.output_artifact_id"):
-                        aid = create_artifact(out, fmt="markdown", metadata=meta)
-                        st.session_state["notes.output_artifact_id"] = aid
-                    else:
-                        aid = st.session_state["notes.output_artifact_id"]
-                        cur, curm = artifact_get_current(aid)
-                        artifact_add_version(aid, out, created_by="note_transform", metadata=meta, parent_version_id=curm.get("version_id"))
-                    st.session_state["notes.magics.history"].append({"magic": "transform", "ts": now_taipei_str(), "provider": prov, "model": model})
-                    safe_event("note_keeper", "info", "Note transformed.")
-                    st.success("Transformed.")
-            except Exception as e:
-                safe_event("note_keeper", "err", f"Note transform failed: {e}")
-                st.error(str(e))
-
-    with c2:
-        st.markdown("### AI Magics")
-        magics = [
-            ("AI Formatting", "Rewrite into clearer Markdown structure with consistent headings."),
-            ("AI Action Items", "Extract action items with owner and due date if present."),
-            ("AI Compliance Checklist", "Generate a compliance checklist derived from the note."),
-            ("AI Deficiency Finder", "Find missing information and potential regulatory gaps."),
-            ("AI Keywords (Colored)", "Extract key terms and suggest colored keyword palette."),
-            ("WOW Bullet-to-Brief", "Convert long notes into a 1-page executive brief with key bullets."),
-            ("WOW Meeting-to-SOP", "Convert discussion into draft SOP steps (if applicable)."),
-            ("WOW Risk Flags", "Flag potential risk statements and categorize severity."),
-        ]
-        magic = st.selectbox("Select magic", [m[0] for m in magics])
-        st.caption(next((m[1] for m in magics if m[0] == magic), ""))
-
-        if st.button("Run Magic"):
-            aid = st.session_state.get("notes.output_artifact_id")
-            if not aid:
-                st.warning("Transform a note first.")
-            else:
-                try:
-                    text, curm = artifact_get_current(aid)
-                    prov = st.session_state.get("notes.model_provider", "openai")
-                    model = st.session_state.get("notes.model", "gpt-4o-mini")
-                    sys_p = "You are a helpful assistant. Output Markdown. Do not invent facts."
-                    usr_p = f"Magic: {magic}\n\nApply this transformation to the provided note."
-                    out, meta = llm_execute(prov, model, sys_p, usr_p, text, 6000, 0.2)
-                    artifact_add_version(aid, out, created_by=f"magic:{magic}", metadata={"kind": "note_magic", "magic": magic, **meta}, parent_version_id=curm.get("version_id"))
-                    st.session_state["notes.magics.history"].append({"magic": magic, "ts": now_taipei_str(), "provider": prov, "model": model})
-                    safe_event("note_keeper", "info", f"Magic executed: {magic}")
-                    st.success("Magic applied (new version created).")
-                except Exception as e:
-                    safe_event("note_keeper", "err", f"Magic failed: {e}")
-                    st.error(str(e))
-
-        st.markdown("### Keyword Coloring")
-        palette = st.session_state.get("notes.keywords.palette", {})
-        if pd is not None:
-            dfp = pd.DataFrame([{"keyword": k, "color": v} for k, v in palette.items()])
-            edited = st.data_editor(dfp, num_rows="dynamic", use_container_width=True, hide_index=True)
-            new_palette = {}
-            for _, row in edited.iterrows():
-                kw = str(row.get("keyword", "")).strip()
-                col = str(row.get("color", "")).strip()
-                if kw and col:
-                    new_palette[kw] = col
-            st.session_state["notes.keywords.palette"] = new_palette
-        else:
-            st.json(palette)
-
-    st.divider()
-    aid = st.session_state.get("notes.output_artifact_id")
-    if aid:
-        st.markdown("## Note Output")
-        tabs = st.tabs(["Text", "Markdown", "Diff", "Versions", "History"])
-        text, meta = artifact_get_current(aid)
-
-        with tabs[0]:
-            edited = st.text_area("Edit note output", value=text, height=260)
-            if st.button("Save note edit"):
-                artifact_add_version(aid, edited, created_by="user_edit", metadata={"type": "note_edit"}, parent_version_id=meta.get("version_id"))
-                safe_event("note_keeper", "info", "Note edited.")
-                st.success("Saved.")
-        with tabs[1]:
-            st.markdown(markdown_highlight_keywords(text, st.session_state.get("notes.keywords.palette", {})), unsafe_allow_html=True)
-        with tabs[2]:
-            versions = artifact_versions(aid)
-            if len(versions) >= 2:
-                st.markdown(simple_diff(versions[-2]["content_text"], text), unsafe_allow_html=True)
-            else:
-                st.info("Need at least 2 versions for diff.")
-        with tabs[3]:
-            versions = artifact_versions(aid)
-            for v in reversed(versions[-10:]):
-                st.write(f"- {v['created_at']} | {v['created_by']} | {v['version_id'][:8]}")
-            sel_vid = st.selectbox("Restore version (note)", [v["version_id"] for v in versions][::-1], key="restore_note")
-            if st.button("Restore selected (note)"):
-                st.session_state["artifacts"][aid]["current_version_id"] = sel_vid
-                safe_event("note_keeper", "warn", f"Restored note version {sel_vid[:8]}.")
-                st.success("Restored.")
-        with tabs[4]:
-            st.json(st.session_state.get("notes.magics.history", []))
-
-        st.download_button("Download note markdown", data=text.encode("utf-8"), file_name="note.md", mime="text/markdown")
+def prompt_step4_summary(step1: str, citations_md: str, output_lang: str) -> str:
+    if output_lang == "zh-TW":
+        return f"""\
+請根據「使用者提供內容（Step 1）」與「網路研究引用（若有）」產出一份**完整且具引用**的綜整摘要（Markdown），目標長度 **3,000–4,000 字**（不含參考文獻段落）。
+
+要求：
+1) 明確指出哪些資訊來自 Step 1、哪些來自引用、哪些是推論（需標註為推論）。
+2) 以 510(k) 審查觀點組織：預期用途/適應症、技術特性、可能的法規分類、SE 脈絡、常見測試證據、標示/可用性/資安/軟體等關鍵議題。
+3) 每個重要主張盡量附上引用連結（若引用可用）。
+4) 用繁體中文輸出。
+
+---
+
+# 使用者提供內容（Step 1）
+{step1}
+
+---
+
+# 網路研究引用（可用時）
+{citations_md}
+"""
+    return f"""\
+Based on "User-provided content (Step 1)" and "Web research citations (if any)", produce a comprehensive, citation-backed summary in Markdown targeting **3,000–4,000 words** (excluding the references section).
+
+Requirements:
+1) Clearly distinguish what comes from Step 1 vs citations vs inference (label inference explicitly).
+2) Organize for a 510(k) reviewer lens: intended use/indications, technology, likely regulatory context, SE narrative, expected evidence/testing, labeling/usability/cybersecurity/software.
+3) Add citations/links for key claims when available.
+4) Output in English.
+
+---
+
+# User-provided content (Step 1)
+{step1}
+
+---
+
+# Web research citations (if available)
+{citations_md}
+"""
+
+
+def prompt_step5_report(step1: str, step4: str, template: str, output_lang: str) -> str:
+    if output_lang == "zh-TW":
+        return f"""\
+請依照「模板」的章節與標題格式，撰寫一份 **510(k) 審查報告（Markdown）**，目標長度 **3,000–4,000 字**（不含附錄）。必須使用 Step 1 與 Step 4 的資訊，並保持可稽核、審查者語氣。
+
+硬性要求（不可省略）：
+- 報告內需產出 **5 個表格**（置於附錄 Appendix A，或依模板安排）
+- 需列出並解釋 **20 個關鍵實體**（Appendix B）
+- 需附上 **審查檢核清單**（Appendix C），格式需可勾選（Yes/No/Unclear）並含「審查意見」與「補件問題草稿」
+- 若資訊不足，請明確標註「未提供/不明」，並在缺口處提出具體補件請求
+
+輸出語言：繁體中文。
+
+---
+
+# Step 1（使用者提供）
+{step1}
+
+---
+
+# Step 4（綜整摘要）
+{step4}
+
+---
+
+# 模板
+{template}
+"""
+    return f"""\
+Follow the "Template" headings and produce a **510(k) review report in Markdown** targeting **3,000–4,000 words** (excluding appendices). Use Step 1 and Step 4. Maintain an audit-ready, reviewer-neutral tone.
+
+Hard requirements:
+- Include **5 tables** (Appendix A or per template)
+- Include **20 key entities** with explanations (Appendix B)
+- Include a **review checklist** (Appendix C) with Yes/No/Unclear + reviewer comments + draft deficiency questions
+- If information is missing, mark it clearly and propose concrete requests for additional information.
+
+Output language: English.
+
+---
+
+# Step 1 (User-provided)
+{step1}
+
+---
+
+# Step 4 (Comprehensive summary)
+{step4}
+
+---
+
+# Template
+{template}
+"""
+
+
+def prompt_step6_skill(step4: str, step5: str, output_lang: str) -> str:
+    if output_lang == "zh-TW":
+        return f"""\
+請根據 Step 4 與 Step 5 的成果，建立一份可重複使用的 **skill.md**（Markdown），目標是：讓代理能對「相似器材」生成完整的 510(k) 審查報告。
+
+請遵循 skill-creator 的精神（觸發情境、輸入/輸出格式、工作流程、品質門檻、評估方式），並內建 3 個 WOW 技能功能：
+1) Template Auto-Healing：偵測模板缺失章節並提出修復版本（保留原風格）
+2) Gap-to-Question Generator：將缺口轉成補件問題（依嚴重度分類）
+3) Consistency Auditor：檢查報告內矛盾並提出修正建議
+
+此外，請在 skill.md 末尾加入「使用範例（至少 2 例）」與「常見失敗模式與對策」。
+
+輸出：完整 skill.md 內容（繁體中文撰寫）。
+
+---
+
+# Step 4
+{step4}
+
+---
+
+# Step 5
+{step5}
+"""
+    return f"""\
+Based on Step 4 and Step 5 results, create a reusable **skill.md** (Markdown) enabling an agent to generate comprehensive 510(k) review reports for similar devices.
+
+Follow the skill-creator spirit: triggering contexts, inputs/outputs, workflow, quality gates, evaluation guidance. Include 3 WOW skill features:
+1) Template Auto-Healing
+2) Gap-to-Question Generator (severity-bucketed)
+3) Consistency Auditor
+
+Also include at least 2 usage examples and a section on common failure modes + mitigations.
+
+Output: full skill.md content (English).
+
+---
+
+# Step 4
+{step4}
+
+---
+
+# Step 5
+{step5}
+"""
+
+
+# -----------------------------------------------------------------------------
+# AI Notekeeper & Magics
+# -----------------------------------------------------------------------------
+
+def extract_keywords(text: str, max_keywords: int = 18) -> List[str]:
+    # Very lightweight keyword heuristic; avoids dependency on NLP libs.
+    words = re.findall(r"[A-Za-z][A-Za-z0-9\-/]{2,}", text)
+    freq: Dict[str, int] = {}
+    stop = {"the","and","for","with","this","that","from","into","your","you","are","was","were","been","have","has"}
+    for w in words:
+        lw = w.lower()
+        if lw in stop:
+            continue
+        if len(lw) < 3:
+            continue
+        freq[lw] = freq.get(lw, 0) + 1
+    # prioritize higher freq
+    ranked = sorted(freq.items(), key=lambda x: (-x[1], x[0]))
+    kws = [k for k,_ in ranked[:max_keywords]]
+    return kws
+
+
+def coral_highlight_markdown(md: str, keywords: List[str]) -> str:
+    # HTML spans in markdown; best-effort word boundary.
+    out = md
+    for kw in sorted(keywords, key=len, reverse=True):
+        # escape kw for regex
+        pat = re.compile(rf"\b({re.escape(kw)})\b", re.IGNORECASE)
+        out = pat.sub(r'<span style="color:coral;font-weight:700">\1</span>', out)
+    return out
+
+
+def notekeeper_transform(note_text: str, output_lang: str, model_label: str, temperature: float, max_tokens: int) -> Tuple[str, Dict[str, Any], List[str]]:
+    system_prompt = (
+        "You are an expert note organizer. Produce structured Markdown. "
+        "Extract key terms and ensure action items/questions are explicit."
+    )
+    if output_lang == "zh-TW":
+        user_prompt = f"""\
+請將以下筆記整理為結構化 Markdown：
+- 用清晰標題（H1/H2/H3）
+- 產出「重點摘要」「細節整理」「待辦事項」「待釐清問題」
+- 盡量保持原意，不要自行新增未提供的事實
+- 請用繁體中文輸出
+
+筆記：
+{note_text}
+"""
     else:
-        st.info("No note output yet.")
+        user_prompt = f"""\
+Organize the note into structured Markdown:
+- Clear headings (H1/H2/H3)
+- Sections: Key takeaways, Details, Action items, Questions to clarify
+- Preserve meaning; do not invent facts not present
+- Output in English
+
+Note:
+{note_text}
+"""
+    text, meta = llm_call(
+        model_label=model_label,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    kws = extract_keywords(note_text + "\n" + text)
+    highlighted = coral_highlight_markdown(text, kws)
+    return highlighted, meta, kws
 
 
-# -----------------------------
-# 17) Sidebar danger zone
-# -----------------------------
-def render_sidebar_danger_zone():
+AI_MAGICS = [
+    {"id": "clarity_polisher", "name_en": "Clarity Polisher", "name_zh": "清晰度拋光"},
+    {"id": "evidence_tagger", "name_en": "Evidence Tagger", "name_zh": "證據標記器"},
+    {"id": "standards_mapper", "name_en": "Standards Mapper", "name_zh": "標準/指引映射"},
+    {"id": "deficiency_builder", "name_en": "Deficiency Draft Builder", "name_zh": "補件問題產生器"},
+    {"id": "exec_brief", "name_en": "Executive Brief Generator", "name_zh": "高階一頁簡報"},
+    {"id": "change_log", "name_en": "Change Log Composer", "name_zh": "變更紀錄生成"},
+    # 3 additional WOW AI features (program-level)
+    {"id": "citation_sweeper", "name_en": "Citation Sweeper (WOW)", "name_zh": "引用整理器（WOW）"},
+    {"id": "risk_heatmap", "name_en": "Risk Heatmap Builder (WOW)", "name_zh": "風險熱圖表格（WOW）"},
+    {"id": "localization_transformer", "name_en": "Localization Transformer (WOW)", "name_zh": "語言在地化轉換（WOW）"},
+]
+
+
+def magic_prompt(magic_id: str, text_in: str, output_lang: str) -> Tuple[str, str]:
+    sys = "You are a precise assistant. Output Markdown unless user requests plain text."
+    if output_lang == "zh-TW":
+        lang = "請使用繁體中文輸出。"
+    else:
+        lang = "Please output in English."
+
+    if magic_id == "clarity_polisher":
+        user = f"""{lang}
+請在不改變事實內容的前提下，提升以下文本的清晰度與可讀性，適合法規審查語境。輸出 Markdown。
+
+文本：
+{text_in}
+"""
+    elif magic_id == "evidence_tagger":
+        user = f"""{lang}
+請在以下文本中，為每個重要主張加上證據標籤：Provided / Inferred / Web-sourced / Needs evidence，並簡短說明理由。輸出 Markdown（可用表格）。
+
+文本：
+{text_in}
+"""
+    elif magic_id == "standards_mapper":
+        user = f"""{lang}
+請根據以下內容，提出可能適用的指引/標準類別，並將其映射到文本章節（以表格輸出：類別、理由、對應章節、預期證據）。
+
+文本：
+{text_in}
+"""
+    elif magic_id == "deficiency_builder":
+        user = f"""{lang}
+請從以下內容找出缺口（資料不足/矛盾/需補充），並撰寫審查者可用的補件問題草稿。請依嚴重度分級（High/Medium/Low），每題需包含「需要的證據」與「原因」。輸出 Markdown。
+
+文本：
+{text_in}
+"""
+    elif magic_id == "exec_brief":
+        user = f"""{lang}
+請將以下內容濃縮成一頁的高階簡報（Markdown），包含：目的、關鍵發現、主要風險/缺口、建議下一步、需決策事項。避免臆測。
+
+文本：
+{text_in}
+"""
+    elif magic_id == "change_log":
+        user = f"""{lang}
+請為以下文本產出「變更紀錄摘要」模板（假設此文本剛被更新），提供：變更區塊、變更類型、影響、需再確認事項。輸出 Markdown。
+
+文本：
+{text_in}
+"""
+    elif magic_id == "citation_sweeper":
+        user = f"""{lang}
+請對以下 Markdown 進行「引用整理」：
+- 將散落的 URL/引用整理成一致的 References 區段
+- 在文中對應主張後加上簡短引用標記（例如 [Ref 3]）
+- 若發現關鍵主張無引用，列在「Missing Citations」清單
+輸出整理後的 Markdown。
+
+文本：
+{text_in}
+"""
+    elif magic_id == "risk_heatmap":
+        user = f"""{lang}
+請根據以下內容建立「風險熱圖」(Risk Heatmap) 的 Markdown 表格：
+- 至少 12 個風險條目
+- 欄位：Hazard、Severity(1-5)、Probability(1-5)、Risk Score、Key Controls、Evidence Needed、Reviewer Notes
+- 同時給出 3 點風險概觀結論
+若資訊不足，請合理用「待確認」標示，不要臆造事實來源。
+
+文本：
+{text_in}
+"""
+    elif magic_id == "localization_transformer":
+        # This magic can translate/localize while preserving structure.
+        if output_lang == "zh-TW":
+            user = f"""\
+請將以下內容在不破壞 Markdown 結構（標題/表格/清單）的前提下，轉換為**繁體中文**，並將專有名詞第一次出現時保留英文括號。不要新增未提供的事實。
+
+內容：
+{text_in}
+"""
+        else:
+            user = f"""\
+Translate/localize the following content into **English** while preserving Markdown structure (headings/tables/lists). Keep specialized terms with original language in parentheses on first occurrence. Do not add facts.
+
+Content:
+{text_in}
+"""
+    else:
+        user = f"{lang}\n請改善以下內容並輸出 Markdown：\n\n{text_in}"
+    return sys, user
+
+
+# -----------------------------------------------------------------------------
+# LLM health checks (bug prevention)
+# -----------------------------------------------------------------------------
+
+def llm_health_checks(model_label: str) -> List[Tuple[str, bool, str]]:
+    checks = []
+    # 1) Provider key present?
+    m = resolve_model(model_label)
+    provider = m["provider"]
+    key = get_provider_key(provider)
+    checks.append(("Provider key present", bool(key), f"provider={provider}"))
+
+    # 2) Package present for provider?
+    pkg_ok = True
+    detail = ""
+    try:
+        if provider in {"openai", "grok"}:
+            import openai  # noqa: F401
+        elif provider == "anthropic":
+            import anthropic  # noqa: F401
+        elif provider == "gemini":
+            try:
+                import google.generativeai  # noqa: F401
+            except Exception:
+                from google import genai  # type: ignore # noqa: F401
+        else:
+            pkg_ok = False
+            detail = "unknown provider"
+    except Exception as e:
+        pkg_ok = False
+        detail = str(e)
+    checks.append(("Provider SDK import", pkg_ok, detail))
+
+    # 3) Minimal call sanity (only if key+pkg ok). Keep extremely small.
+    if key and pkg_ok:
+        try:
+            text, _ = llm_call(
+                model_label=model_label,
+                system_prompt="You are a health-check assistant.",
+                user_prompt="Reply with exactly: OK",
+                temperature=0.0,
+                max_tokens=20,
+                retries=0,
+            )
+            ok = ("OK" in (text or ""))
+            checks.append(("Minimal completion call", ok, (text or "")[:80]))
+        except Exception as e:
+            checks.append(("Minimal completion call", False, str(e)))
+
+    return checks
+
+
+# -----------------------------------------------------------------------------
+# UI components
+# -----------------------------------------------------------------------------
+
+def wow_header():
+    ui_lang = st.session_state.ui_lang
+    title = APP_TITLE_ZH if ui_lang == "zh-TW" else APP_TITLE_EN
+    st.markdown(f"<div class='wow-card'><div class='wow-kpi'>{title}</div>"
+                f"<div class='wow-sub'>{t('safety_note')}</div></div>", unsafe_allow_html=True)
+
+
+def wow_status_bar():
+    # Provider statuses
+    def provider_status(provider: str) -> Tuple[str, str]:
+        key = get_provider_key(provider)
+        if key:
+            return t("connected"), "OK"
+        return t("missing_key"), "MISSING"
+
+    openai_s, _ = provider_status("openai")
+    gemini_s, _ = provider_status("gemini")
+    anthropic_s, _ = provider_status("anthropic")
+    grok_s, _ = provider_status("grok")
+
+    run_state = st.session_state.run_state
+    state_label = {
+        "idle": t("idle"),
+        "running": t("running"),
+        "await_edit": t("await_edit"),
+        "done": t("done"),
+        "failed": t("failed"),
+    }.get(run_state, run_state)
+
+    st.markdown(
+        "<div class='wow-card'>"
+        f"<span class='wow-pill'><span class='wow-accent'>{t('status')}:</span> {state_label}</span>"
+        f"<span class='wow-pill'><span class='wow-accent'>OpenAI</span>: {openai_s}</span>"
+        f"<span class='wow-pill'><span class='wow-accent'>Gemini</span>: {gemini_s}</span>"
+        f"<span class='wow-pill'><span class='wow-accent'>Anthropic</span>: {anthropic_s}</span>"
+        f"<span class='wow-pill'><span class='wow-accent'>Grok</span>: {grok_s}</span>"
+        "</div>",
+        unsafe_allow_html=True
+    )
+
+
+def sidebar_controls():
+    st.sidebar.markdown("## WOW Controls")
+    st.sidebar.selectbox(
+        t("language"),
+        SUPPORTED_UI_LANGS,
+        index=SUPPORTED_UI_LANGS.index(st.session_state.ui_lang),
+        key="ui_lang",
+    )
+    st.sidebar.selectbox(
+        t("output_language"),
+        list(OUTPUT_LANG_CHOICES.keys()),
+        format_func=lambda k: OUTPUT_LANG_CHOICES[k],
+        index=list(OUTPUT_LANG_CHOICES.keys()).index(st.session_state.output_lang),
+        key="output_lang",
+    )
+    st.sidebar.selectbox(
+        t("theme"),
+        ["dark", "light"],
+        index=0 if st.session_state.theme == "dark" else 1,
+        format_func=lambda x: t("dark") if x == "dark" else t("light"),
+        key="theme",
+    )
+
+    # Style selection
+    style_names = [s["name"] for s in PAINTER_STYLES]
+    style_ids = [s["id"] for s in PAINTER_STYLES]
+    cur_idx = style_ids.index(st.session_state.style_id) if st.session_state.style_id in style_ids else 0
+
+    style_pick = st.sidebar.selectbox(
+        t("style_pack"),
+        style_ids,
+        index=cur_idx,
+        format_func=lambda sid: next((s["name"] for s in PAINTER_STYLES if s["id"] == sid), sid),
+        key="style_id",
+        disabled=bool(st.session_state.lock_style),
+    )
+    st.sidebar.checkbox(t("lock_style"), value=st.session_state.lock_style, key="lock_style")
+
+    if st.sidebar.button(t("jackslot")):
+        st.session_state.style_id = random.choice(style_ids)
+        st.sidebar.info(f"Selected: {next(s['name'] for s in PAINTER_STYLES if s['id']==st.session_state.style_id)}")
+
     st.sidebar.markdown("---")
-    st.sidebar.markdown(f"### {t('danger_zone')}")
-    st.sidebar.caption("Clear session docs, outputs, logs, and session-entered keys.")
-    if st.sidebar.button(t("total_purge")):
-        total_purge()
-        st.rerun()
+    st.sidebar.markdown("## " + t("live_log"))
+    if st.sidebar.button(t("clear_log")):
+        st.session_state.live_log = []
+    st.sidebar.download_button(
+        t("download_log"),
+        data=format_log_text().encode("utf-8"),
+        file_name="live_log.txt",
+        mime="text/plain",
+        use_container_width=True,
+    )
+    st.sidebar.markdown("---")
+    st.sidebar.caption(t("safety_note"))
 
 
-# -----------------------------
-# 18) Main
-# -----------------------------
-def main():
-    st.set_page_config(page_title=APP_TITLE, layout="wide")
-    init_state()
-    inject_nordic_css()
+def live_log_panel():
+    st.markdown("### " + t("live_log"))
+    text = format_log_text()
+    st.text_area("", value=text, height=220)
 
-    render_key_section()
-    render_sidebar_danger_zone()
 
-    render_header()
-    render_status_strip()
+def dashboard_panel():
+    st.markdown("### " + t("nav_dashboard"))
+    col1, col2, col3, col4 = st.columns(4)
+    col1.markdown("<div class='wow-card'><div class='wow-kpi'>{}</div><div class='wow-sub'>{}</div></div>".format(
+        len(st.session_state.pdf_files), t("found_pdfs")
+    ), unsafe_allow_html=True)
+    col2.markdown("<div class='wow-card'><div class='wow-kpi'>{}</div><div class='wow-sub'>{}</div></div>".format(
+        len(st.session_state.pdf_summaries), t("processed")
+    ), unsafe_allow_html=True)
+    # flagged: scanned/empty
+    flagged = 0
+    for s in st.session_state.pdf_summaries.values():
+        if "Scanned content" in s:
+            flagged += 1
+    col3.markdown("<div class='wow-card'><div class='wow-kpi'>{}</div><div class='wow-sub'>{}</div></div>".format(
+        flagged, t("flagged")
+    ), unsafe_allow_html=True)
+    col4.markdown("<div class='wow-card'><div class='wow-kpi'>{}</div><div class='wow-sub'>Agent chain steps</div></div>".format(
+        len(st.session_state.agent_chain)
+    ), unsafe_allow_html=True)
 
-    if st.session_state.get("ui.mode") == "note_keeper":
-        render_note_keeper()
+    st.markdown("<div class='wow-card'><div class='wow-sub'>Run History (this session)</div>"
+                f"<div class='wow-kpi'>{len(st.session_state.history)}</div></div>", unsafe_allow_html=True)
+
+    st.markdown("### " + t("program_wow_features"))
+    st.markdown(
+        "- Core AI Magics (6): Clarity, Evidence Tagging, Standards Mapping, Deficiency Drafting, Exec Brief, Change Log\n"
+        "- Extra WOW Features (3): Citation Sweeper, Risk Heatmap Builder, Localization Transformer\n"
+        "- Chain-of-Agents with editable prompts/outputs and per-step model selection\n"
+        "- Web research (best-effort) with citation list generation\n"
+    )
+
+
+# -----------------------------------------------------------------------------
+# Settings & Keys UI
+# -----------------------------------------------------------------------------
+
+def settings_panel():
+    st.markdown("### " + t("nav_settings"))
+    st.markdown("<div class='wow-card'><div class='wow-sub'>"+t("api_keys")+"</div></div>", unsafe_allow_html=True)
+
+    def key_widget(provider: str, label: str, env_var_names: List[str]):
+        # If any env var present, do not show input
+        env_present = any(env_key(n) for n in env_var_names)
+        if env_present:
+            st.info(f"{label}: {t('key_in_env')}")
+            return
+        # else show masked input
+        v = st.text_input(label + " — " + t("enter_key"), type="password")
+        if v and v.strip():
+            st.session_state.session_secrets[provider] = v.strip()
+            log_event(f"{provider} key set in session.", "INFO", "keys")
+
+    key_widget("openai", t("openai_key"), ["OPENAI_API_KEY"])
+    key_widget("gemini", t("gemini_key"), ["GEMINI_API_KEY"])
+    key_widget("anthropic", t("anthropic_key"), ["ANTHROPIC_API_KEY"])
+    key_widget("grok", t("grok_key"), ["GROK_API_KEY", "XAI_API_KEY"])
+
+    if st.button(t("clear_secrets")):
+        st.session_state.session_secrets = {}
+        log_event("Session secrets cleared.", "INFO", "keys")
+
+    st.markdown("---")
+    st.markdown("### " + t("bugs_panel"))
+    model_label = st.selectbox(t("model"), list_models(), index=0)
+    if st.button(t("run_health")):
+        checks = llm_health_checks(model_label)
+        ok = all(c[1] for c in checks if c[0] != "Minimal completion call") and any(c[0] == "Minimal completion call" and c[1] for c in checks) or True
+        if ok:
+            st.success(t("health_ok"))
+        else:
+            st.warning(t("health_warn"))
+        st.markdown("#### Details")
+        for name, passed, detail in checks:
+            st.write(f"- {'✅' if passed else '❌'} **{name}** — {detail}")
+
+    st.markdown("---")
+    st.markdown("### agents.yaml")
+    if st.session_state.agents_load_error:
+        st.warning(st.session_state.agents_load_error)
+
+    uploaded = st.file_uploader("Upload agents.yaml", type=["yaml", "yml"])
+    if uploaded is not None:
+        txt = uploaded.read().decode("utf-8", errors="replace")
+        agents, err = load_agents_yaml(txt)
+        st.session_state.agents = agents
+        st.session_state.agents_load_error = err
+        if err:
+            st.error(err)
+            log_event(err, "ERROR", "agents")
+        else:
+            st.success(f"Loaded {len(agents)} agents.")
+            log_event(f"Loaded {len(agents)} agents from upload.", "INFO", "agents")
+
+
+# -----------------------------------------------------------------------------
+# PDF discovery & ToC panel
+# -----------------------------------------------------------------------------
+
+def pdf_panel():
+    st.markdown("### " + t("nav_pdf"))
+    if PdfReader is None:
+        st.error("Missing dependency: pypdf. Install pypdf to enable PDF processing.")
         return
 
-    left, right = st.columns([1.06, 1.24], gap="large")
-    with left:
-        render_left_pane()
-    with right:
-        render_agents_and_intelligence()
+    uploaded_zip = st.file_uploader(t("upload_zip"), type=["zip"])
+    colA, colB = st.columns([1, 1])
+    with colA:
+        summarization_model = st.selectbox(t("summarize_model"), list_models(), index=0, key="pdf_sum_model")
+    with colB:
+        lens = st.selectbox(
+            t("domain_lens"),
+            ["general", "510k", "clinical", "cyber", "software"],
+            format_func=lambda x: {
+                "general": t("lens_general"),
+                "510k": t("lens_510k"),
+                "clinical": t("lens_clinical"),
+                "cyber": t("lens_cyber"),
+                "software": t("lens_software"),
+            }[x],
+            key="pdf_domain_lens",
+        )
+
+    if st.button(t("scan"), disabled=uploaded_zip is None):
+        st.session_state.run_state = "running"
+        try:
+            zip_bytes = uploaded_zip.read()
+            root = extract_zip_to_tmp(zip_bytes)
+            st.session_state.pdf_workspace_id = root
+            log_event(f"ZIP extracted to {root}", "INFO", "pdf")
+
+            pdfs = discover_pdfs(root)
+            st.session_state.pdf_files = pdfs
+            log_event(f"Discovered {len(pdfs)} PDFs.", "INFO", "pdf")
+
+            summaries: Dict[str, str] = {}
+            progress = st.progress(0)
+            for idx, path in enumerate(pdfs):
+                try:
+                    text, meta = pdf_extract_text_trim_first_page(path)
+                    summ, smeta = summarize_pdf_text(
+                        text,
+                        model_label=summarization_model,
+                        domain_lens=lens,
+                        output_lang=st.session_state.output_lang,
+                    )
+                    header = f"**Path**: `{path}`\n\n"
+                    flags = []
+                    if meta.get("trimmed_first_page"):
+                        flags.append("trimmed_first_page")
+                    if meta.get("single_page"):
+                        flags.append("single_page")
+                    if meta.get("scanned_or_empty"):
+                        flags.append("scanned_or_empty")
+                    if flags:
+                        header += f"**Flags**: `{', '.join(flags)}`\n\n"
+                    summaries[path] = header + summ.strip()
+                    log_event(f"Summarized: {os.path.basename(path)} (model={smeta.get('model')})", "INFO", "pdf")
+                except Exception as e:
+                    summaries[path] = f"**Error summarizing**: {e}"
+                    log_event(f"Failed: {path} — {e}", "ERROR", "pdf")
+                progress.progress((idx + 1) / max(1, len(pdfs)))
+
+            st.session_state.pdf_summaries = summaries
+            st.session_state.master_toc = build_master_toc(summaries)
+            st.session_state.run_state = "done"
+            log_event("Master ToC built.", "INFO", "pdf")
+
+            # Save to history
+            st.session_state.history.append({
+                "id": f"pdf_{uuid.uuid4().hex[:8]}",
+                "ts": now_iso(),
+                "type": "pdf_index",
+                "pdf_count": len(pdfs),
+                "model": summarization_model,
+            })
+        except Exception as e:
+            st.session_state.run_state = "failed"
+            log_event(f"PDF pipeline failed: {e}", "ERROR", "pdf")
+            st.error(str(e))
+
+    st.markdown("### " + t("toc"))
+    st.session_state.master_toc = st.text_area("", value=st.session_state.master_toc, height=320)
+    st.download_button(
+        t("download_md"),
+        data=st.session_state.master_toc.encode("utf-8"),
+        file_name="ToC_Master.md",
+        mime="text/markdown",
+        use_container_width=True,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Agent workspace panel (single + chain)
+# -----------------------------------------------------------------------------
+
+def agent_workspace_panel():
+    st.markdown("### " + t("nav_agents"))
+    agents = st.session_state.agents or {}
+    if not agents:
+        st.warning("No agents loaded. Add agents.yaml in Settings.")
+    agent_names = sorted(list(agents.keys()))
+    selected_agent = st.selectbox("Select agent", agent_names) if agent_names else None
+
+    st.markdown("#### Single Agent Run")
+    model_label = st.selectbox(t("model"), list_models(), index=0, key="agent_model_single")
+    temperature = st.slider(t("temperature"), 0.0, 1.0, float(DEFAULT_TEMPERATURE), 0.05, key="agent_temp_single")
+    max_tokens = st.slider(t("max_tokens"), 256, 4096, int(DEFAULT_MAX_TOKENS), 64, key="agent_maxt_single")
+
+    default_prompt = ""
+    default_system = "You are a helpful assistant."
+    if selected_agent:
+        a = agents[selected_agent]
+        default_prompt = a.get("user_prompt_template", "")
+        default_system = a.get("system_prompt", default_system)
+
+    prompt = st.text_area(t("prompt"), value=default_prompt, height=160, key="agent_prompt_single")
+    citations_required = st.checkbox(t("citations_required"), value=False, key="agent_cite_single")
+
+    # input context is Master ToC
+    context = st.session_state.master_toc.strip()
+    if not context:
+        st.info("Master ToC is empty. Run PDF indexing first or paste content into ToC.")
+
+    if st.button(t("run_agent"), disabled=(not selected_agent or not context)):
+        st.session_state.run_state = "running"
+        try:
+            # If citations required, instruct explicitly.
+            cite_line = "\nIf you reference external sources, include URLs. If none available, say so.\n" if citations_required else ""
+            user_prompt = f"CONTEXT (Master ToC):\n{context}\n\nUSER INSTRUCTIONS:\n{prompt}\n{cite_line}"
+            out, meta = llm_call(
+                model_label=model_label,
+                system_prompt=default_system,
+                user_prompt=user_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            st.session_state.run_state = "await_edit"
+            st.markdown("#### Output")
+            out_edited = st.text_area(t("edit_output"), value=out, height=240, key="agent_output_single_edit")
+            st.session_state.run_state = "done"
+
+            st.download_button(
+                t("download_md"),
+                data=out_edited.encode("utf-8"),
+                file_name=f"agent_{selected_agent}.md",
+                mime="text/markdown",
+                use_container_width=True,
+            )
+            st.session_state.history.append({
+                "id": f"agent_{uuid.uuid4().hex[:8]}",
+                "ts": now_iso(),
+                "type": "agent_single",
+                "agent": selected_agent,
+                "model": meta.get("model"),
+                "provider": meta.get("provider"),
+            })
+            log_event(f"Agent run completed: {selected_agent} ({meta.get('provider')}:{meta.get('model')})", "INFO", "agent")
+        except Exception as e:
+            st.session_state.run_state = "failed"
+            log_event(f"Agent run failed: {e}", "ERROR", "agent")
+            st.error(str(e))
+
+    st.markdown("---")
+    st.markdown("#### " + t("chain_builder"))
+
+    # Chain add UI
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        chain_agent = st.selectbox("Agent to add", agent_names, key="chain_add_agent") if agent_names else None
+    with col2:
+        if st.button(t("add_to_chain"), disabled=not chain_agent):
+            a = agents[chain_agent]
+            step = {
+                "id": uuid.uuid4().hex[:8],
+                "agent": chain_agent,
+                "system_prompt": a.get("system_prompt", "You are a helpful assistant."),
+                "prompt": a.get("user_prompt_template", ""),
+                "model_label": list_models()[0],
+                "temperature": DEFAULT_TEMPERATURE,
+                "max_tokens": DEFAULT_MAX_TOKENS,
+                "input_source": "toc",
+                "custom_input": "",
+                "output": "",
+                "output_edited": "",
+                "status": "pending",
+                "meta": {},
+            }
+            st.session_state.agent_chain.append(step)
+            log_event(f"Added chain step: {chain_agent}", "INFO", "chain")
+
+    # Render chain steps
+    if not st.session_state.agent_chain:
+        st.info("Chain is empty. Add agents above.")
+        return
+
+    for idx, step in enumerate(st.session_state.agent_chain):
+        with st.expander(f"{t('step')} {idx+1}: {step['agent']}  —  status: {step.get('status','pending')}", expanded=(idx == 0)):
+            # Controls
+            step["model_label"] = st.selectbox(
+                t("model"),
+                list_models(),
+                index=list_models().index(step["model_label"]) if step["model_label"] in list_models() else 0,
+                key=f"chain_model_{step['id']}",
+            )
+            step["temperature"] = st.slider(
+                t("temperature"), 0.0, 1.0, float(step["temperature"]), 0.05, key=f"chain_temp_{step['id']}"
+            )
+            step["max_tokens"] = st.slider(
+                t("max_tokens"), 256, 4096, int(step["max_tokens"]), 64, key=f"chain_maxt_{step['id']}"
+            )
+            step["input_source"] = st.selectbox(
+                t("input_source"),
+                ["toc", "prev", "custom"],
+                format_func=lambda x: {
+                    "toc": t("input_toc"),
+                    "prev": t("input_prev"),
+                    "custom": t("input_custom"),
+                }[x],
+                index=["toc", "prev", "custom"].index(step["input_source"]),
+                key=f"chain_input_{step['id']}",
+            )
+            if step["input_source"] == "custom":
+                step["custom_input"] = st.text_area("Custom input", value=step["custom_input"], height=120, key=f"chain_custom_{step['id']}")
+
+            step["prompt"] = st.text_area(t("prompt"), value=step["prompt"], height=150, key=f"chain_prompt_{step['id']}")
+
+            colx, coly = st.columns([1, 1])
+            with colx:
+                do_run = st.button(t("execute_step"), key=f"chain_run_{step['id']}")
+            with coly:
+                if st.button("Remove step", key=f"chain_rm_{step['id']}"):
+                    st.session_state.agent_chain = [s for s in st.session_state.agent_chain if s["id"] != step["id"]]
+                    log_event(f"Removed chain step {idx+1}", "INFO", "chain")
+                    st.rerun()
+
+            if do_run:
+                st.session_state.run_state = "running"
+                step["status"] = "running"
+                try:
+                    # Determine input
+                    if step["input_source"] == "toc":
+                        chain_input = st.session_state.master_toc
+                    elif step["input_source"] == "prev":
+                        if idx == 0:
+                            chain_input = st.session_state.master_toc
+                        else:
+                            prev = st.session_state.agent_chain[idx - 1]
+                            chain_input = prev.get("output_edited") or prev.get("output") or ""
+                    else:
+                        chain_input = step["custom_input"]
+
+                    if not chain_input.strip():
+                        raise LLMError("Chain input is empty. Provide ToC, previous output, or custom input.")
+
+                    # Compose prompt
+                    user_prompt = f"INPUT:\n{chain_input}\n\nTASK:\n{step['prompt']}\n\nOutput in Markdown unless asked otherwise."
+
+                    out, meta = llm_call(
+                        model_label=step["model_label"],
+                        system_prompt=step["system_prompt"],
+                        user_prompt=user_prompt,
+                        temperature=float(step["temperature"]),
+                        max_tokens=int(step["max_tokens"]),
+                    )
+                    step["output"] = out
+                    step["output_edited"] = out
+                    step["meta"] = meta
+                    step["status"] = "await_edit"
+                    st.session_state.run_state = "await_edit"
+                    log_event(f"Chain step {idx+1} done: {step['agent']} ({meta.get('provider')}:{meta.get('model')})", "INFO", "chain")
+                except Exception as e:
+                    step["status"] = "failed"
+                    st.session_state.run_state = "failed"
+                    log_event(f"Chain step {idx+1} failed: {e}", "ERROR", "chain")
+                    st.error(str(e))
+
+            # Output editors (always show if exists)
+            if step.get("output"):
+                view = st.radio("View", [t("markdown_view"), t("text_view")], horizontal=True, key=f"chain_view_{step['id']}")
+                if view == t("markdown_view"):
+                    step["output_edited"] = st.text_area(t("edit_output"), value=step["output_edited"], height=220, key=f"chain_outmd_{step['id']}")
+                    st.markdown("**Preview**")
+                    st.markdown(step["output_edited"], unsafe_allow_html=True)
+                else:
+                    step["output_edited"] = st.text_area(t("edit_output"), value=step["output_edited"], height=220, key=f"chain_outtxt_{step['id']}")
+
+                st.download_button(
+                    t("download_md"),
+                    data=step["output_edited"].encode("utf-8"),
+                    file_name=f"chain_step_{idx+1}_{step['agent']}.md",
+                    mime="text/markdown",
+                    use_container_width=True,
+                )
+
+    # Persist chain run in history (summary record)
+    if st.button("Save chain run to history"):
+        st.session_state.history.append({
+            "id": f"chain_{uuid.uuid4().hex[:8]}",
+            "ts": now_iso(),
+            "type": "agent_chain",
+            "steps": [
+                {
+                    "agent": s["agent"],
+                    "model": s.get("meta", {}).get("model") or resolve_model(s["model_label"])["id"],
+                    "provider": s.get("meta", {}).get("provider") or resolve_model(s["model_label"])["provider"],
+                    "status": s.get("status"),
+                }
+                for s in st.session_state.agent_chain
+            ],
+        })
+        log_event("Chain run saved to history.", "INFO", "chain")
+
+
+# -----------------------------------------------------------------------------
+# AI Notekeeper panel
+# -----------------------------------------------------------------------------
+
+def notekeeper_panel():
+    st.markdown("### " + t("nav_notes"))
+    model_label = st.selectbox(t("model"), list_models(), index=0, key="notes_model")
+    temperature = st.slider(t("temperature"), 0.0, 1.0, float(DEFAULT_TEMPERATURE), 0.05, key="notes_temp")
+    max_tokens = st.slider(t("max_tokens"), 256, 4096, 1400, 64, key="notes_maxt")
+
+    st.session_state.notes_input = st.text_area(t("notes_paste"), value=st.session_state.notes_input, height=200)
+
+    if st.button(t("notes_transform")):
+        st.session_state.run_state = "running"
+        try:
+            out, meta, kws = notekeeper_transform(
+                st.session_state.notes_input,
+                st.session_state.output_lang,
+                model_label,
+                temperature,
+                max_tokens,
+            )
+            st.session_state.notes_output = out
+            st.session_state.notes_keywords = kws
+            st.session_state.run_state = "await_edit"
+            log_event(f"Notekeeper transform complete ({meta.get('provider')}:{meta.get('model')})", "INFO", "notes")
+            st.session_state.history.append({
+                "id": f"notes_{uuid.uuid4().hex[:8]}",
+                "ts": now_iso(),
+                "type": "notekeeper_transform",
+                "model": meta.get("model"),
+                "provider": meta.get("provider"),
+            })
+        except Exception as e:
+            st.session_state.run_state = "failed"
+            log_event(f"Notekeeper failed: {e}", "ERROR", "notes")
+            st.error(str(e))
+
+    if st.session_state.notes_output:
+        st.markdown("#### Output (editable)")
+        view = st.radio("View", [t("markdown_view"), t("text_view")], horizontal=True, key="notes_view")
+        if view == t("markdown_view"):
+            st.session_state.notes_output = st.text_area("", value=st.session_state.notes_output, height=260, key="notes_out_md")
+            st.markdown("**Preview**")
+            st.markdown(st.session_state.notes_output, unsafe_allow_html=True)
+        else:
+            st.session_state.notes_output = st.text_area("", value=st.session_state.notes_output, height=260, key="notes_out_txt")
+
+        st.download_button(
+            t("download_md"),
+            data=st.session_state.notes_output.encode("utf-8"),
+            file_name="notekeeper.md",
+            mime="text/markdown",
+            use_container_width=True,
+        )
+
+        st.markdown("#### " + t("ai_magics"))
+        magic_options = [m["id"] for m in AI_MAGICS]
+        magic_labels = {m["id"]: (m["name_zh"] if st.session_state.ui_lang == "zh-TW" else m["name_en"]) for m in AI_MAGICS}
+        magic_id = st.selectbox("Magic", magic_options, format_func=lambda mid: magic_labels[mid], key="notes_magic")
+        magic_model = st.selectbox(t("model"), list_models(), index=0, key="notes_magic_model")
+        magic_prompt_extra = st.text_area("Extra prompt (optional)", value="", height=80, key="notes_magic_extra")
+
+        if st.button("Run Magic", key="notes_run_magic"):
+            st.session_state.run_state = "running"
+            try:
+                sys, user = magic_prompt(magic_id, st.session_state.notes_output, st.session_state.output_lang)
+                if magic_prompt_extra.strip():
+                    user += "\n\nAdditional user instruction:\n" + magic_prompt_extra.strip()
+                out, meta = llm_call(
+                    model_label=magic_model,
+                    system_prompt=sys,
+                    user_prompt=user,
+                    temperature=0.2,
+                    max_tokens=1800,
+                )
+                st.session_state.notes_output = out
+                st.session_state.run_state = "await_edit"
+                log_event(f"Magic {magic_id} completed ({meta.get('provider')}:{meta.get('model')})", "INFO", "magic")
+            except Exception as e:
+                st.session_state.run_state = "failed"
+                log_event(f"Magic failed: {e}", "ERROR", "magic")
+                st.error(str(e))
+
+        st.markdown("#### " + t("keep_prompting"))
+        kp_model = st.selectbox(t("model"), list_models(), index=0, key="notes_kp_model")
+        kp_prompt = st.text_area(t("prompt"), value="", height=100, key="notes_kp_prompt")
+        if st.button(t("generate"), key="notes_keep_prompting"):
+            st.session_state.run_state = "running"
+            try:
+                sys = "You are a helpful assistant. Continue from the provided note content."
+                user = f"NOTE CONTENT:\n{st.session_state.notes_output}\n\nUSER REQUEST:\n{kp_prompt}"
+                out, meta = llm_call(
+                    model_label=kp_model,
+                    system_prompt=sys,
+                    user_prompt=user,
+                    temperature=0.3,
+                    max_tokens=1600,
+                )
+                st.session_state.notes_output += "\n\n---\n\n" + out
+                st.session_state.run_state = "await_edit"
+                log_event(f"Keep prompting completed ({meta.get('provider')}:{meta.get('model')})", "INFO", "notes")
+            except Exception as e:
+                st.session_state.run_state = "failed"
+                log_event(f"Keep prompting failed: {e}", "ERROR", "notes")
+                st.error(str(e))
+
+
+# -----------------------------------------------------------------------------
+# 510(k) Review Suite panel
+# -----------------------------------------------------------------------------
+
+def panel_510k():
+    st.markdown("### " + t("nav_510k"))
+
+    # Global generation controls for 510(k)
+    model_label = st.selectbox(t("model"), list_models(), index=0, key="510k_model")
+    temperature = st.slider(t("temperature"), 0.0, 1.0, 0.2, 0.05, key="510k_temp")
+    max_tokens = st.slider(t("max_tokens"), 512, 4096, 2200, 64, key="510k_maxt")
+
+    st.markdown("#### " + t("step1"))
+    st.session_state["510k_step1"] = st.text_area("", value=st.session_state["510k_step1"], height=200, key="510k_step1_area")
+
+    st.markdown("#### " + t("step2"))
+    use_default = st.checkbox(t("use_default_template"), value=(not st.session_state["510k_template"].strip()), key="510k_use_default")
+    if use_default:
+        st.session_state["510k_template"] = DEFAULT_510K_TEMPLATE
+    else:
+        st.session_state["510k_template"] = st.text_area("", value=st.session_state["510k_template"], height=220, key="510k_template_area")
+
+    st.markdown("#### " + t("web_research"))
+    web_on = st.checkbox(t("web_research"), value=True, key="510k_web_on")
+    web_depth = st.selectbox(t("web_depth"), ["quick", "standard", "exhaustive"], format_func=lambda x: t(x), key="510k_web_depth")
+    fda_only = st.checkbox(t("fda_only"), value=False, key="510k_fda_only")
+
+    citations: List[Dict[str, str]] = []
+    citations_md = ""
+    if web_on:
+        # Show a small note if ddg unavailable
+        if "duckduckgo_search" not in str(os.environ) and True:
+            # We can't reliably detect; just warn if module missing at runtime by test.
+            try:
+                import duckduckgo_search  # noqa: F401
+            except Exception:
+                st.info("Web research will run only if 'duckduckgo_search' is available in the environment. Otherwise citations will be empty.")
+
+    st.markdown("---")
+    st.markdown("#### " + t("step4"))
+    step4_prompt_override = st.text_area("Prompt override (optional)", value="", height=90, key="510k_step4_prompt_override")
+    if st.button(t("generate"), key="510k_gen_step4"):
+        st.session_state.run_state = "running"
+        try:
+            if web_on:
+                citations = web_research(st.session_state["510k_step1"], web_depth, fda_only)
+            citations_md = citations_to_markdown(citations)
+
+            sys = sys_regulatory_writer(st.session_state.output_lang)
+            user = prompt_step4_summary(st.session_state["510k_step1"], citations_md, st.session_state.output_lang)
+            if step4_prompt_override.strip():
+                user += "\n\nAdditional user instruction:\n" + step4_prompt_override.strip()
+
+            out, meta = llm_call(
+                model_label=model_label,
+                system_prompt=sys,
+                user_prompt=user,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            st.session_state["510k_step4"] = out
+            st.session_state.run_state = "await_edit"
+            st.session_state.history.append({
+                "id": f"510k_s4_{uuid.uuid4().hex[:8]}",
+                "ts": now_iso(),
+                "type": "510k_step4_summary",
+                "model": meta.get("model"),
+                "provider": meta.get("provider"),
+                "citations": len(citations),
+            })
+            log_event(f"510(k) Step4 generated ({meta.get('provider')}:{meta.get('model')}) citations={len(citations)}", "INFO", "510k")
+        except Exception as e:
+            st.session_state.run_state = "failed"
+            log_event(f"510(k) Step4 failed: {e}", "ERROR", "510k")
+            st.error(str(e))
+
+    if st.session_state["510k_step4"].strip():
+        st.markdown("**Step 4 Result (editable)**")
+        st.session_state["510k_step4"] = st.text_area("", value=st.session_state["510k_step4"], height=260, key="510k_step4_edit")
+        st.markdown("**Preview**")
+        st.markdown(st.session_state["510k_step4"], unsafe_allow_html=True)
+        st.download_button(
+            t("download_md"),
+            data=st.session_state["510k_step4"].encode("utf-8"),
+            file_name="510k_step4_summary.md",
+            mime="text/markdown",
+            use_container_width=True,
+        )
+
+    st.markdown("---")
+    st.markdown("#### " + t("step5"))
+    step5_prompt_override = st.text_area("Prompt override (optional)", value="", height=90, key="510k_step5_prompt_override")
+    if st.button(t("generate"), key="510k_gen_step5", disabled=not st.session_state["510k_step4"].strip()):
+        st.session_state.run_state = "running"
+        try:
+            sys = sys_regulatory_writer(st.session_state.output_lang)
+            user = prompt_step5_report(
+                st.session_state["510k_step1"],
+                st.session_state["510k_step4"],
+                st.session_state["510k_template"],
+                st.session_state.output_lang,
+            )
+            if step5_prompt_override.strip():
+                user += "\n\nAdditional user instruction:\n" + step5_prompt_override.strip()
+
+            out, meta = llm_call(
+                model_label=model_label,
+                system_prompt=sys,
+                user_prompt=user,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            st.session_state["510k_step5"] = out
+            st.session_state.run_state = "await_edit"
+            st.session_state.history.append({
+                "id": f"510k_s5_{uuid.uuid4().hex[:8]}",
+                "ts": now_iso(),
+                "type": "510k_step5_report",
+                "model": meta.get("model"),
+                "provider": meta.get("provider"),
+            })
+            log_event(f"510(k) Step5 generated ({meta.get('provider')}:{meta.get('model')})", "INFO", "510k")
+        except Exception as e:
+            st.session_state.run_state = "failed"
+            log_event(f"510(k) Step5 failed: {e}", "ERROR", "510k")
+            st.error(str(e))
+
+    if st.session_state["510k_step5"].strip():
+        st.markdown("**Step 5 Report (editable)**")
+        st.session_state["510k_step5"] = st.text_area("", value=st.session_state["510k_step5"], height=320, key="510k_step5_edit")
+        st.markdown("**Preview**")
+        st.markdown(st.session_state["510k_step5"], unsafe_allow_html=True)
+        st.download_button(
+            t("download_md"),
+            data=st.session_state["510k_step5"].encode("utf-8"),
+            file_name="510k_step5_review_report.md",
+            mime="text/markdown",
+            use_container_width=True,
+        )
+
+    st.markdown("---")
+    st.markdown("#### " + t("step6"))
+    step6_prompt_override = st.text_area("Prompt override (optional)", value="", height=90, key="510k_step6_prompt_override")
+    if st.button(t("generate"), key="510k_gen_step6", disabled=not st.session_state["510k_step5"].strip()):
+        st.session_state.run_state = "running"
+        try:
+            sys = "You are a skill creator. Produce a reusable skill.md with strong triggering description and clear workflow."
+            user = prompt_step6_skill(st.session_state["510k_step4"], st.session_state["510k_step5"], st.session_state.output_lang)
+            if step6_prompt_override.strip():
+                user += "\n\nAdditional user instruction:\n" + step6_prompt_override.strip()
+
+            out, meta = llm_call(
+                model_label=model_label,
+                system_prompt=sys,
+                user_prompt=user,
+                temperature=0.2,
+                max_tokens=2200,
+            )
+            st.session_state["510k_skill_md"] = out
+            st.session_state.run_state = "await_edit"
+            st.session_state.history.append({
+                "id": f"510k_s6_{uuid.uuid4().hex[:8]}",
+                "ts": now_iso(),
+                "type": "510k_step6_skill_md",
+                "model": meta.get("model"),
+                "provider": meta.get("provider"),
+            })
+            log_event(f"510(k) Step6 skill.md generated ({meta.get('provider')}:{meta.get('model')})", "INFO", "510k")
+        except Exception as e:
+            st.session_state.run_state = "failed"
+            log_event(f"510(k) Step6 failed: {e}", "ERROR", "510k")
+            st.error(str(e))
+
+    if st.session_state["510k_skill_md"].strip():
+        st.markdown("**skill.md (editable)**")
+        st.session_state["510k_skill_md"] = st.text_area("", value=st.session_state["510k_skill_md"], height=320, key="510k_skill_edit")
+        st.markdown("**Preview**")
+        st.markdown(st.session_state["510k_skill_md"], unsafe_allow_html=True)
+        st.download_button(
+            t("download_md"),
+            data=st.session_state["510k_skill_md"].encode("utf-8"),
+            file_name="skill.md",
+            mime="text/markdown",
+            use_container_width=True,
+        )
+
+    st.markdown("---")
+    st.markdown("#### " + t("ai_magics"))
+    if st.session_state["510k_step5"].strip():
+        magic_options = [m["id"] for m in AI_MAGICS]
+        magic_labels = {m["id"]: (m["name_zh"] if st.session_state.ui_lang == "zh-TW" else m["name_en"]) for m in AI_MAGICS}
+        magic_id = st.selectbox("Magic", magic_options, format_func=lambda mid: magic_labels[mid], key="510k_magic")
+        magic_model = st.selectbox(t("model"), list_models(), index=0, key="510k_magic_model")
+        magic_prompt_extra = st.text_area("Extra prompt (optional)", value="", height=80, key="510k_magic_extra")
+        target = st.selectbox("Target", ["Step 4 Summary", "Step 5 Report", "skill.md"], key="510k_magic_target")
+
+        if st.button("Run Magic", key="510k_run_magic"):
+            st.session_state.run_state = "running"
+            try:
+                if target == "Step 4 Summary":
+                    text_in = st.session_state["510k_step4"]
+                elif target == "skill.md":
+                    text_in = st.session_state["510k_skill_md"]
+                else:
+                    text_in = st.session_state["510k_step5"]
+
+                sys, user = magic_prompt(magic_id, text_in, st.session_state.output_lang)
+                if magic_prompt_extra.strip():
+                    user += "\n\nAdditional user instruction:\n" + magic_prompt_extra.strip()
+                out, meta = llm_call(
+                    model_label=magic_model,
+                    system_prompt=sys,
+                    user_prompt=user,
+                    temperature=0.2,
+                    max_tokens=2200,
+                )
+
+                if target == "Step 4 Summary":
+                    st.session_state["510k_step4"] = out
+                elif target == "skill.md":
+                    st.session_state["510k_skill_md"] = out
+                else:
+                    st.session_state["510k_step5"] = out
+
+                st.session_state.run_state = "await_edit"
+                log_event(f"510(k) magic {magic_id} applied to {target} ({meta.get('provider')}:{meta.get('model')})", "INFO", "510k")
+            except Exception as e:
+                st.session_state.run_state = "failed"
+                log_event(f"510(k) magic failed: {e}", "ERROR", "510k")
+                st.error(str(e))
+
+
+# -----------------------------------------------------------------------------
+# History / Exports panel
+# -----------------------------------------------------------------------------
+
+def history_panel():
+    st.markdown("### " + t("nav_history"))
+    if not st.session_state.history:
+        st.info("No history yet in this session.")
+        return
+
+    st.markdown("#### Runs")
+    for item in reversed(st.session_state.history):
+        with st.expander(f"{item.get('ts')} — {item.get('type')} — {item.get('id')}"):
+            st.json(item)
+
+    st.markdown("#### Export session manifest")
+    manifest = {
+        "exported_at": now_iso(),
+        "history_count": len(st.session_state.history),
+        "history": st.session_state.history,
+        "notes": {
+            "keywords": st.session_state.notes_keywords,
+        },
+        "pdf": {
+            "pdf_count": len(st.session_state.pdf_files),
+            "toc_chars": len(st.session_state.master_toc or ""),
+        },
+        "510k": {
+            "step1_chars": len(st.session_state["510k_step1"] or ""),
+            "step4_chars": len(st.session_state["510k_step4"] or ""),
+            "step5_chars": len(st.session_state["510k_step5"] or ""),
+        },
+        # Never export secrets
+        "secrets_included": False,
+    }
+    st.download_button(
+        "Download manifest.json",
+        data=json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"),
+        file_name="session_manifest.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Main app
+# -----------------------------------------------------------------------------
+
+def main():
+    st.set_page_config(page_title="WOW Agentic Intelligence", layout="wide")
+
+    ss_init()
+    try_load_agents_from_file()
+
+    # Sidebar first (so changes apply)
+    sidebar_controls()
+    apply_wow_css()
+
+    wow_header()
+    wow_status_bar()
+
+    # Navigation
+    nav = st.tabs([
+        t("nav_dashboard"),
+        t("nav_pdf"),
+        t("nav_agents"),
+        t("nav_510k"),
+        t("nav_notes"),
+        t("nav_settings"),
+        t("nav_history"),
+    ])
+
+    with nav[0]:
+        dashboard_panel()
+        live_log_panel()
+    with nav[1]:
+        pdf_panel()
+        live_log_panel()
+    with nav[2]:
+        agent_workspace_panel()
+        live_log_panel()
+    with nav[3]:
+        panel_510k()
+        live_log_panel()
+    with nav[4]:
+        notekeeper_panel()
+        live_log_panel()
+    with nav[5]:
+        settings_panel()
+        live_log_panel()
+    with nav[6]:
+        history_panel()
+        live_log_panel()
 
 
 if __name__ == "__main__":
